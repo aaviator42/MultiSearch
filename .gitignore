@@ -1,0 +1,26 @@
+# data/ ships with the repo — the Open English WordNet zip, the synonym DB
+# built from it, and saved test-suite snapshots — EXCEPT the Simple English
+# Wikipedia corpus, which is too big for a git repo (dump ~525 MB, index
+# ~1.1 GB). Rebuild those with scripts/download-wikipedia.php and
+# scripts/build-index.php.
+data/simplewiki-latest.json.bz2
+data/.dump-date
+data/wikipedia.db
+data/wikipedia.db-journal
+
+# Runtime artifacts the demo app creates on first use (all disposable; the
+# search log records client IPs, so never publish it).
+data/search_log.db
+data/search_log.db-wal
+data/search_log.db-shm
+data/result_cache.db
+data/result_cache.db-wal
+data/result_cache.db-shm
+data/admin-cache.json
+
+# Session/scratch artifacts
+tmp-estimate/
+errors_httpd.log
+
+# PHP CLI error log (created next to scripts on fatal errors)
+error_log
