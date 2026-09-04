@@ -20,7 +20,7 @@ Here's some info about it:
  * It supports full query syntax: required (`+`) and excluded (`-`) words, adjacency-verified `"phrases"`, `wild*` prefixes, and `word^2.5` boosts, all combinable.
  * It expands queries in layers: typo-tolerant fuzzy matching, rule-based stemming, dictionary-verified stemming, morphological expansion, and WordNet synonyms and derivations. Every expansion is score-discounted, so a machine guess never outranks the words the user actually typed.
  * It scales well. The same code searches a ten-document test fixture and the 283,000-article Simple English Wikipedia index (48M postings, 1.1M unique terms, a 1.1 GB SQLite file).
- * It supports 9 scoring algorithms: `auto`, BM25, BM25+Coverage, BM25F, Reciprocal Rank Fusion, DFR, Coverage, Rarity and Frequency. Each is described in [Scoring algorithms](#scoring-algorithms).
+ * It supports 9 scoring algorithms: auto, BM25, BM25+Coverage, BM25F, Reciprocal Rank Fusion, DFR, Coverage, Rarity and Frequency. Each is described in [Scoring algorithms](#scoring-algorithms).
 
 ## Get started
 
