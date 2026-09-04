@@ -142,7 +142,7 @@ foreach ($result['hits'] as $docId => $hit) {
 ]
 ```
 
-### MultiBuilder.php reference
+## MultiBuilder.php reference
 
 `\MultiSearch\Builder` writes the index. There are two ways in:
 
@@ -169,9 +169,9 @@ $b->rebuildStats();   // REQUIRED before searching
 \MultiSearch\Builder::bulkBuild('index.db', $generator, ['doc_id_type' => 'INTEGER']);
 ```
 
-#### Functions
+### Functions
 
-##### 1. `new \MultiSearch\Builder(<db path>, <config>)`
+#### 1. `new \MultiSearch\Builder(<db path>, <config>)`
 
 Opens or creates an index file. `<config>` is an optional array:
 
@@ -185,7 +185,7 @@ Field names must match `[a-z][a-z0-9_]{0,30}` (up to 31 characters), because the
 
 The file is opened in WAL mode with a 5-second busy timeout, so concurrent writers wait instead of failing. New files get 16 KB pages.
 
-##### 2. `addText(<doc id>, <field texts>, <title>, <opening>)`
+#### 2. `addText(<doc id>, <field texts>, <title>, <opening>)`
 
 Adds or replaces a document from raw text per field:
 
@@ -198,7 +198,7 @@ $b->addText('42', ['name' => 'Spaghetti Carbonara', 'steps' => 'Boil the...'], '
  * Re-adding an existing doc id replaces it across all fields.
  * Does not update stats. Call `rebuildStats()` when you're done.
 
-##### 3. `addDocument(<doc id>, <fields>, <title>, <opening>)`
+#### 3. `addDocument(<doc id>, <fields>, <title>, <opening>)`
 
 Same as `addText()`, but takes pre-tokenized arrays:
 
@@ -209,15 +209,15 @@ $b->addDocument('doc1', ['body' => ['solar', 'solar', 'system']]);
  * Repeated tokens become term frequency.
  * Token order becomes positions on a positional index. If you pass unique tokens for binary matching, phrase queries won't match that document.
 
-##### 4. `removeDocument(<doc id>)`
+#### 4. `removeDocument(<doc id>)`
 
 Deletes a document from the postings, the length table, and the `documents` table. Does not update stats.
 
-##### 5. `rebuildStats()`
+#### 5. `rebuildStats()`
 
 Recomputes the per-field term statistics, corpus aggregates, and the unique-term list from the current postings. **Must be called after changes and before searching.** Until then, new terms have no IDF and fuzzy matching can't see them.
 
-##### 6. `indexDocuments(<docs>)`
+#### 6. `indexDocuments(<docs>)`
 
 Bulk add plus an automatic `rebuildStats()`:
 
@@ -227,7 +227,7 @@ $b->indexDocuments(['doc1' => ['title' => [...], 'body' => [...]], ...]);
 
 Takes pre-tokenized arrays, no titles.
 
-##### 7. `Builder::bulkBuild(<db path>, <docs>, <config>)` (static)
+#### 7. `Builder::bulkBuild(<db path>, <docs>, <config>)` (static)
 
 Streams documents into a **fresh** file using staging tables plus one sorted insert per field, which fills each B-tree sequentially without page splits.
 
@@ -247,7 +247,7 @@ $summary = \MultiSearch\Builder::bulkBuild('index.db', $gen, ['doc_id_type' => '
  * Writes with journaling off and an exclusive lock. The file isn't searchable until the call returns. A failed build is rebuilt from scratch.
  * Returns a summary: `['docs' => int, 'skipped' => int, 'fields' => [f => ['postings' => int, 'terms' => int, 'docs' => int]], 'bytes' => int, 'elapsed' => float]`.
 
-##### 8. `getFields()`, `getTermList(<field>)`, `getStats()`, `hasPositions()`, `docIdType()`
+#### 8. `getFields()`, `getTermList(<field>)`, `getStats()`, `hasPositions()`, `docIdType()`
 
 Introspection helpers:
 
@@ -257,7 +257,7 @@ Introspection helpers:
  * `hasPositions()`: whether this index stores token positions.
  * `docIdType()`: `'TEXT'` or `'INTEGER'`.
 
-### MultiSearch.php reference
+## MultiSearch.php reference
 
 `\MultiSearch\Searcher` reads an index. It has one constructor, one search method, and a handful of static helpers.
 
@@ -268,9 +268,9 @@ $result = $s->search('+"solar system" planet*', ['algo' => 'auto', 'confidence' 
 
 The index is opened truly read-only (the OS enforces it) with a 2 GB memory map and a 128 MB page cache. Concurrent reader processes don't block each other.
 
-#### Functions
+### Functions
 
-##### 1. `new \MultiSearch\Searcher(<db path>, <profile>)`
+#### 1. `new \MultiSearch\Searcher(<db path>, <profile>)`
 
 Opens an index. Configuration errors throw an `InvalidArgumentException` with an actionable message right here: a missing file, a file that isn't a MultiSearch index, or a typo'd ranking knob.
 
@@ -291,7 +291,7 @@ Opens an index. Configuration errors throw an `InvalidArgumentException` with an
 | `term_normalizer` | `null` | `callable(term): string` applied to every query term. Required if you indexed with a custom tokenizer |
 | `fold_diacritics` | auto | whether query terms are diacritic-folded. Omit it: the searcher reads the index's `meta` table and does the right thing. Set a bool only for an index with no `meta` row |
 
-##### 2. `search(<query>, <options>)`
+#### 2. `search(<query>, <options>)`
 
 Runs a query. `<options>` is an optional array:
 
@@ -313,7 +313,7 @@ Runs a query. `<options>` is an optional array:
 
 Returns the array shown in [Basic Usage](#basic-usage). A query that matches nothing returns an empty `hits` array; it never throws.
 
-##### 3. Static helpers and constants
+#### 3. Static helpers and constants
 
  * `Searcher::VERSION`: the engine version string (`'3.5'`), bumped whenever ranking can change. The demo app keys its result cache and search log on it.
  * `Searcher::ALGOS`: the accepted `algo` values.
