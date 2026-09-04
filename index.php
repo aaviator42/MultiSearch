@@ -1,4 +1,5 @@
 <!-- MultiSearch — Simple English Wikipedia search demo -->
+<!-- 2026-09-04 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -31,6 +32,14 @@
 	input[type=text] {
 		width: 100%;
 		box-sizing: border-box;
+	}
+	.query-row {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.query-row input[type=text] {
+		flex: 1;
+		min-width: 0;
 	}
 	input[type=number] {
 		width: 3.5rem;
@@ -623,8 +632,14 @@ $oewnAvail = $oewn->ready();
 	<tr>
 		<td style="width:28%;">Query:</td>
 		<td>
-			<input type="text" name="query" value="<?= $qEsc ?>"
-				maxlength="150" autocomplete="off" list="searchpre" required>
+			<div class="query-row">
+				<input type="text" name="query" value="<?= $qEsc ?>"
+					maxlength="150" autocomplete="off" list="searchpre" required>
+				<!-- Second submit, inline with the box, so mouse users don't
+				     have to scroll past the options table to search. Same
+				     name as the bottom button: do_search = "new search, page 1". -->
+				<input type="submit" name="do_search" value="Search!">
+			</div>
 			<!-- Themed (space/astronomy) example set — every entry
 			     verified against the corpus; each demonstrates one feature:
 			     multi-word, required, topic, typo, phrase+required,
@@ -746,7 +761,7 @@ $oewnAvail = $oewn->ready();
 		<td>Stopwords:</td>
 		<td>
 			<label><input type="checkbox" name="remove_stopwords" value="1"<?= $chkRemStop ?>>
-				Skip common words (the, is, of…) while searching — never applied to +required words</label>
+				Skip common words (the, is, of…) while searching (never applied to +required words)</label>
 		</td>
 	</tr>
 	<tr>
@@ -764,6 +779,7 @@ $oewnAvail = $oewn->ready();
 		</td>
 	</tr>
 	<tr>
+		<td></td>
 		<td><input type="submit" name="do_search" value="Search!"></td>
 	</tr>
 </table>
@@ -780,8 +796,9 @@ updateDesc();
 function goPage(n) {
 	document.getElementById('pageInput').value = n;
 	const form = document.getElementById('searchForm');
-	const btn  = form.querySelector('[name=do_search]');
-	if (btn) btn.name = '_do_search_disabled';
+	// Two buttons share the name (top and bottom); disable both so a page
+	// flip is never mistaken for a new search.
+	form.querySelectorAll('[name=do_search]').forEach(b => { b.name = '_do_search_disabled'; });
 	form.submit();
 }
 </script>
@@ -954,7 +971,7 @@ $ixPositional = str_contains((string)indexIdentity(), '+pos');
 <br>
 <hr>
 <small>
-	MultiSearch (AGPL-3.0-or-later) &nbsp;|&nbsp;
+	<a href="https://github.com/aaviator42/MultiSearch">MultiSearch</a> v<?= htmlspecialchars(\MultiSearch\Searcher::VERSION) ?> (AGPLv3) &nbsp;|&nbsp;
 	Corpus: <a href="https://simple.wikipedia.org/">Simple English Wikipedia</a> (CC BY-SA 3.0) &nbsp;|&nbsp;
 	<a href="admin.php">Admin / Stats</a>
 </small>

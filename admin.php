@@ -6,6 +6,7 @@
 	<style>
 	body { font-family: Verdana, sans-serif; max-width: 50rem; padding: 2rem; margin: auto; font-size: 1rem; }
 	code, pre { font-family: monospace; background: #e6e6e6; padding: 0 0.2rem; }
+	pre { overflow-x: auto; padding: 0.5rem; }
 	table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1rem; }
 	th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
 	th { background: #f0f0f0; font-weight: bold; }
@@ -30,6 +31,7 @@ $CORPUS = require __DIR__ . '/config/corpus-wikipedia.php';
 define('DB_PATH',      $CORPUS['db']);
 define('OEWN_DB_PATH', $CORPUS['oewn_db']);
 define('DATA_DIR',     dirname(DB_PATH));
+require __DIR__ . '/lib/MultiSearch.php';   // for Searcher::VERSION only — no index is opened here
 define('CACHE_PATH',   DATA_DIR . '/admin-cache.json');
 
 // ── Stats cache ──────────────────────────────────────────────────────────
@@ -147,6 +149,7 @@ php scripts/build-oewn.php           # optional: rebuild the synonym DB from the
 <h2>Search Index <small style="font-weight:normal;">(data/wikipedia.db)</small></h2>
 <?php if ($idxStats): ?>
 <p>
+	Engine: <b>MultiSearch v<?= htmlspecialchars(\MultiSearch\Searcher::VERSION) ?></b> &nbsp;|&nbsp;
 	Built: <b><?= date('Y-m-d H:i:s', $idxStats['dbMtime']) ?></b> &nbsp;|&nbsp;
 	Size: <b><?= round($idxStats['dbSize'] / 1024 / 1024, 1) ?> MB</b> &nbsp;|&nbsp;
 	Articles: <b><?= number_format($idxStats['docs']) ?></b> &nbsp;|&nbsp;
