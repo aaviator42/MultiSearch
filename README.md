@@ -1,6 +1,7 @@
 # MultiSearch
 A highly modular and adaptable search engine, with support for multiple ranking algorithms and corpus types. It grew out of lessons learned running [iSearch](https://github.com/aaviator42/iSearch) in production.
  
+Try it live [here](https://aavi.xyz/proj/MultiSearch/)!
 
 Current library version: `3.7` | `2026-09-13`
 
@@ -74,7 +75,7 @@ A third file, `lib/OewnSynonyms.php`, is optional. It turns Open English WordNet
 
 ### How a search works
 
-One `search()` call runs seven stages: parse, expand, weigh, retrieve, prune and fetch, score, present. The diagram below traces the example query `einstien "solar systems" -moon` through every stage, with the numbers from a real run on the Wikipedia index. Click for full size, or open the [HTML version](docs/search-pipeline.html).
+One `search()` call runs seven stages: parse, expand, weigh, retrieve, prune and fetch, score, present. The diagram below traces the example query `einstien "solar systems" -moon` through every stage, with the numbers from a real run on the Wikipedia index. Click for full size, or open the [HTML version](https://aavi.xyz/proj/MultiSearch/docs/search-pipeline.html).
 
 [![The seven stages of the MultiSearch pipeline](docs/search-pipeline.png)](docs/search-pipeline.png)
 
