@@ -2392,10 +2392,12 @@ class Searcher
         $prunedCandidates = $this->pruneByMask($masks, $pruneLimit, $hasCoverage);
         unset($masks, $survivors);
 
-        // Materialize [docId][term] => freq for the survivors only. Same
-        // shape the scorers, passesRequired() and passesExcluded() always
-        // read; they never touched non-survivors anyway.
-        $fieldPostings = [];
+        // Materialize [term][docId] => freq per field for the survivors only
+        // (term-major — see fetchPostingsForDocs for why). The scorers,
+        // passesRequired() and passesExcluded() never touched non-survivors
+        // anyway.
+        $fieldPostings = [];   // field => [term => [docId => freq]]
+        $fieldDocs     = [];   // field => [docId => true]  (docs with any row in that field)
         $survivorIds   = array_keys($prunedCandidates);
         foreach (array_keys($fields) as $field) {
             $fetchTerms = array_values(array_unique(array_merge(
@@ -2406,7 +2408,7 @@ class Searcher
             )));
             $rows = 0;
             foreach ($fetchTerms as $t) $rows += $termStatsByF[$field][$t] ?? 0;
-            $fieldPostings[$field] = $this->fetchPostingsForDocs($field, $fetchTerms, $survivorIds, $rows);
+            [$fieldPostings[$field], $fieldDocs[$field]] = $this->fetchPostingsForDocs($field, $fetchTerms, $survivorIds, $rows);
         }
 
         // --- Positional phrase data ---
@@ -2514,19 +2516,40 @@ class Searcher
         $fieldScores = [];
         $matches     = [];
 
-        foreach (array_keys($prunedCandidates) as $docId) {
-            if (!$this->passesRequired($docId, $reqExpansions, $fields, $fieldPostings)) continue;
+        // One closure scores one candidate and returns ['score', 'fields',
+        // 'matches'] — or null when a filter rejects it. The main loop below
+        // keeps ONLY the score per candidate; the per-field breakdown is
+        // recomputed for the paged ids after ranking (see the page slice).
+        //
+        // Earlier: the loop filled $fieldScores[docId][field] and
+        // $matches[docId][field][] for EVERY candidate, then the page slice
+        // read ~20 of them. A PHP hash with a few string keys costs ~400 bytes
+        // (8-bucket minimum), the matches shape ~950, so at candidate_limit
+        // 5000 that was a harmless ~7 MB — and at candidate_limit 0 on
+        // "the united states of america" (127K matched docs) it was 153 MB of
+        // a 318 MB peak, which is how exhaustive mode died with a 500/503 on a
+        // 128M-limit host. Measured after: the loop adds 6 MB (one float per
+        // doc). Re-scoring a page of 20-200 docs costs well under a
+        // millisecond; the closure exists so the two call sites share one
+        // body instead of two copies of the algorithm switch drifting apart.
+        $scoreOne = function ($docId) use (
+            $algo, $fields, $fieldPostings, $fieldDocs, $docLengths, $reqExpansions, $excByField, $excludedDocIds,
+            $excPhrases, $reqPhrases, $positionalPhrases, $phrasePositions, $fieldStats, $termStatsByF,
+            $boosts, $rk, $fieldBMap, $scoreTermsByField, $boostTotalByField, $fieldConcepts, $conceptOf,
+            $conceptWeight, $bm25fAllTerms, $bm25fTotalBoost, $bm25fConceptTotal
+        ): ?array {
+            if (!$this->passesRequired($docId, $reqExpansions, $fields, $fieldPostings)) return null;
             // In positional mode the word-level AND-in-field phrase
             // exclusion is REPLACED by true adjacency (passesPhrases below) —
             // passing $excPhrases to both would re-introduce the over-exclusion
             // the positional path exists to fix.
             if (!$this->passesExcluded($docId, $fields, $excByField, $fieldPostings, $excludedDocIds,
-                                       $positionalPhrases ? [] : $excPhrases))  continue;
+                                       $positionalPhrases ? [] : $excPhrases))  return null;
             if ($positionalPhrases
-                && !$this->passesPhrases($docId, $reqPhrases, $excPhrases, array_keys($fields), $phrasePositions)) continue;
+                && !$this->passesPhrases($docId, $reqPhrases, $excPhrases, array_keys($fields), $phrasePositions)) return null;
 
-            $fieldScores[$docId] = [];
-            $matches[$docId]     = [];
+            $fs = [];   // per-field scores for this doc
+            $ms = [];   // per-field matched terms
 
             if ($algo === 'bm25f') {
                 // ── BM25F: single-pass multi-field scoring ──
@@ -2577,7 +2600,7 @@ class Searcher
                     $maxN  = 1;
 
                     foreach ($fields as $field => $weight) {
-                        $tf = $fieldPostings[$field][$docId][$term] ?? 0;
+                        $tf = $fieldPostings[$field][$term][$docId] ?? 0;
                         if ($tf > 0) {
                             $termFound = true;
                             $allMatches[$field][] = $term;
@@ -2585,7 +2608,7 @@ class Searcher
                         $fS    = $fieldStats[$field] ?? ['total_docs' => 1, 'total_length' => 1];
                         $N     = max(1, $fS['total_docs']);
                         $avgdl = max(1, $fS['total_length'] / $N);
-                        $dl    = $docLengths[$docId][$field] ?? 1;
+                        $dl    = $docLengths[$field][$docId] ?? 1;
                         // unlisted fields fall back to the ranking profile's global b
                         $bf    = $fieldB[$field] ?? $rk['b'];
 
@@ -2632,10 +2655,10 @@ class Searcher
                 $bm25fScore *= (1.0 + $coverage * $coverage);
 
                 foreach ($fields as $field => $weight) {
-                    $fieldScores[$docId][$field] = 0; // BM25F doesn't have per-field scores
-                    $matches[$docId][$field] = $allMatches[$field] ?? [];
+                    $fs[$field] = 0; // BM25F doesn't have per-field scores
+                    $ms[$field] = $allMatches[$field] ?? [];
                 }
-                $scores[$docId] = $bm25fScore;
+                $score = $bm25fScore;
 
             } elseif ($algo === 'rrf') {
                 // ── RRF: Reciprocal Rank Fusion (Cormack et al., 2009) ──
@@ -2648,10 +2671,15 @@ class Searcher
 
                 foreach ($fields as $field => $weight) {
                     $scoreTerms  = $scoreTermsByField[$field];   // hoisted, query-invariant
-                    $docPostings = $fieldPostings[$field][$docId] ?? [];
+                    if (!isset($fieldDocs[$field][$docId])) {   // no row in this field: score 0, no matches
+                        $fs[$field] = 0.0;
+                        $ms[$field] = [];
+                        continue;
+                    }
+                    $fieldPost   = $fieldPostings[$field] ?? [];
                     $fStats      = $fieldStats[$field]   ?? ['total_docs' => 1, 'total_length' => 1];
                     $tStats      = $termStatsByF[$field]  ?? [];
-                    $dl          = $docLengths[$docId][$field] ?? 1;
+                    $dl          = $docLengths[$field][$docId] ?? 1;
 
                     // DELIBERATE EXEMPTION: RRF's components always use
                     // per-term accounting (concepts = null), regardless of the
@@ -2661,17 +2689,17 @@ class Searcher
                     // whose arbitrary order pollutes the fusion (measured:
                     // fuzzy MRR .625->.417; 'volcanoe' target rank 1->9). The
                     // bm25 component has no coverage term either way.
-                    $bm25Result = $this->scoreDoc($docPostings, $scoreTerms, 'bm25', $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, null);
-                    $coverResult = $this->scoreDoc($docPostings, $scoreTerms, 'cover', $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, null);
+                    $bm25Result = $this->scoreDoc($fieldPost, $docId, $scoreTerms, 'bm25', $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, null);
+                    $coverResult = $this->scoreDoc($fieldPost, $docId, $scoreTerms, 'cover', $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, null);
 
-                    $fieldScores[$docId][$field] = round($bm25Result['score'], 4);
-                    $matches[$docId][$field]     = $bm25Result['matches'];
+                    $fs[$field] = round($bm25Result['score'], 4);
+                    $ms[$field] = $bm25Result['matches'];
                     $bm25Score  += $weight * $bm25Result['score'];
                     $coverScore += $weight * $coverResult['score'];
                 }
 
                 // Store component scores temporarily; RRF fusion happens after the loop
-                $scores[$docId] = [
+                $score = [
                     'bm25'  => $totalWeight > 0 ? $bm25Score / $totalWeight : 0.0,
                     'cover' => $totalWeight > 0 ? $coverScore / $totalWeight : 0.0,
                 ];
@@ -2683,21 +2711,44 @@ class Searcher
 
                 foreach ($fields as $field => $weight) {
                     $scoreTerms  = $scoreTermsByField[$field];   // hoisted, query-invariant
-                    $docPostings = $fieldPostings[$field][$docId] ?? [];
+                    if (!isset($fieldDocs[$field][$docId])) {   // no row in this field: score 0, no matches
+                        $fs[$field] = 0.0;
+                        $ms[$field] = [];
+                        continue;
+                    }
+                    $fieldPost   = $fieldPostings[$field] ?? [];
                     $fStats      = $fieldStats[$field]   ?? ['total_docs' => 1, 'total_length' => 1];
                     $tStats      = $termStatsByF[$field]  ?? [];
-                    $dl          = $docLengths[$docId][$field] ?? 1;
+                    $dl          = $docLengths[$field][$docId] ?? 1;
 
-                    $result = $this->scoreDoc($docPostings, $scoreTerms, $algo, $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, $fieldConcepts[$field] ?? null, $conceptOf);
+                    $result = $this->scoreDoc($fieldPost, $docId, $scoreTerms, $algo, $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, $fieldConcepts[$field] ?? null, $conceptOf);
 
-                    $fieldScores[$docId][$field] = round($result['score'], 4);
-                    $matches[$docId][$field]     = $result['matches'];
+                    $fs[$field] = round($result['score'], 4);
+                    $ms[$field] = $result['matches'];
                     $weightedScore              += $weight * $result['score'];
                 }
 
-                $scores[$docId] = $totalWeight > 0 ? ($weightedScore / $totalWeight) : 0.0;
+                $score = $totalWeight > 0 ? ($weightedScore / $totalWeight) : 0.0;
             }
 
+            return ['score' => $score, 'fields' => $fs, 'matches' => $ms];
+        };
+
+        // RRF's two components go into two flat float arrays rather than one
+        // ['bm25','cover'] array per doc: same 400-byte-per-doc hash overhead
+        // as the per-field breakdown, 52 MB at 127K candidates. The closure's
+        // transient array is freed on the next iteration.
+        $rrfBm25 = []; $rrfCover = [];
+        foreach (array_keys($prunedCandidates) as $docId) {
+            $r = $scoreOne($docId);
+            if ($r === null) continue;
+            if ($algo === 'rrf') {
+                $rrfBm25[$docId]  = $r['score']['bm25'];
+                $rrfCover[$docId] = $r['score']['cover'];
+                $scores[$docId]   = 0.0;   // filled in by the fusion below
+            } else {
+                $scores[$docId] = $r['score'];
+            }
         }
 
         // --- RRF rank fusion ---
@@ -2708,34 +2759,24 @@ class Searcher
         if ($algo === 'rrf') {
             // 'rrf_k' ranking knob (60 by default — the paper's value)
             $rrfK = $rk['rrf_k'];
-            // Extract component scores
-            $bm25Scores = [];
-            $coverScores = [];
-            foreach ($scores as $docId => $components) {
-                $bm25Scores[$docId] = $components['bm25'];
-                $coverScores[$docId] = $components['cover'];
-            }
-            // Rank each independently (descending score)
-            arsort($bm25Scores);
-            arsort($coverScores);
-
-            $bm25Ranks = [];
+            // Component scores were collected into two flat arrays by the
+            // loop above. Sort each in place (nothing reads them afterwards)
+            // and add 1/(k + rank) straight into $scores, bm25 first. Every
+            // scored doc is in both arrays, so no missing-rank fallback.
+            // Earlier: copies of both arrays, then two rank maps, then a
+            // final pass — four more 127K-entry arrays (~24 MB) on the
+            // exhaustive query, for the same numbers.
+            arsort($rrfBm25);
             $rank = 1;
-            foreach (array_keys($bm25Scores) as $docId) {
-                $bm25Ranks[$docId] = $rank++;
+            foreach (array_keys($rrfBm25) as $docId) {
+                $scores[$docId] = 1.0 / ($rrfK + $rank++);
             }
-            $coverRanks = [];
+            arsort($rrfCover);
             $rank = 1;
-            foreach (array_keys($coverScores) as $docId) {
-                $coverRanks[$docId] = $rank++;
+            foreach (array_keys($rrfCover) as $docId) {
+                $scores[$docId] += 1.0 / ($rrfK + $rank++);
             }
-
-            // Compute RRF score for each doc
-            foreach (array_keys($scores) as $docId) {
-                $rrfScore = 1.0 / ($rrfK + ($bm25Ranks[$docId] ?? PHP_INT_MAX))
-                          + 1.0 / ($rrfK + ($coverRanks[$docId] ?? PHP_INT_MAX));
-                $scores[$docId] = $rrfScore;
-            }
+            unset($rrfBm25, $rrfCover);
         }
 
         // --- Density-based proximity boost ---
@@ -2786,12 +2827,12 @@ class Searcher
                     $proxSum = 0.0;
                     $proxPairs = 0;
                     foreach ($fields as $field => $weight) {
-                        $dl = $docLengths[$docId][$field] ?? 0;
+                        $dl = $docLengths[$field][$docId] ?? 0;
                         if ($dl < 2) continue;
-                        $docP = $fieldPostings[$field][$docId] ?? [];
+                        $docP = $fieldPostings[$field] ?? [];
                         foreach ($termPairs as [$ta, $tb]) {
-                            $fa = $docP[$ta] ?? 0;
-                            $fb = $docP[$tb] ?? 0;
+                            $fa = $docP[$ta][$docId] ?? 0;
+                            $fb = $docP[$tb][$docId] ?? 0;
                             if ($fa === 0 || $fb === 0) continue;
                             // Expected minimum distance between any occurrence of ta and tb:
                             // If both appear frequently in a short doc, distance is small.
@@ -2909,17 +2950,29 @@ class Searcher
 
         if ($conceptCount > 0 && $titleActive) {
             $titlePostings = $fieldPostings[$titleField] ?? [];
-            foreach (array_keys($scores) as $docId) {
-                $titlePost = $titlePostings[$docId] ?? [];
-                if (empty($titlePost)) continue;
-                // Count how many query CONCEPTS appear in the title field
-                $titleMatched = 0;
-                foreach ($titleConcepts as $forms) {
-                    foreach ($forms as $f) {
-                        if (isset($titlePost[$f])) { $titleMatched++; break; }
+            // Count how many query CONCEPTS appear in each title, walking
+            // the title postings term-by-term (they are term-major) so only
+            // docs that HAVE a title hit are ever touched. Earlier this
+            // looped over every scored doc and probed each concept form
+            // against the doc's title row: with doc-major postings the
+            // empty-row check skipped ~80% of docs cheaply; after the switch
+            // to term-major the same loop probed every form for every doc
+            // and went from 72ms to 1.2s on the 127K-doc exhaustive query.
+            // Walking the postings costs one pass over the title cells.
+            $titleMatchedBy = [];   // docId => concepts matched in the title
+            foreach ($titleConcepts as $forms) {
+                $seen = [];         // a concept counts once per doc, whichever form hit
+                foreach ($forms as $f) {
+                    foreach ($titlePostings[$f] ?? [] as $docId => $_) {
+                        if (isset($seen[$docId])) continue;
+                        $seen[$docId] = true;
+                        $titleMatchedBy[$docId] = ($titleMatchedBy[$docId] ?? 0) + 1;
                     }
                 }
-                if ($titleMatched === 0) continue;
+            }
+            unset($seen);
+            foreach ($titleMatchedBy as $docId => $titleMatched) {
+                if (!isset($scores[$docId])) continue;   // filtered out before scoring
                 $matchRatio = $titleMatched / $conceptCount;
 
                 if ($matchRatio >= 1.0) {
@@ -2932,8 +2985,10 @@ class Searcher
                     // count(explode(' ', $docId))). Clamped to 1.0: duplicate query
                     // terms could otherwise push the ratio above 1 (the earlier word-count
                     // denominator had the same theoretical quirk).
-                    $titleLen = $docLengths[$docId][$titleField] ?? 0;
-                    if ($titleLen < 1) $titleLen = count($titlePost);
+                    $titleLen = $docLengths[$titleField][$docId] ?? 0;
+                    if ($titleLen < 1) {   // no doclens row: count the title terms we fetched for it
+                        foreach ($titlePostings as $docs) if (isset($docs[$docId])) $titleLen++;
+                    }
                     // concepts, not raw terms
                     $lenRatio = min(1.0, $conceptCount / max(1, $titleLen));
                     // Earlier: bonus = 1.5 + 0.5 * lenRatio    (max 2.0x, spread too narrow)
@@ -2999,8 +3054,8 @@ class Searcher
             $cmp = $scores[$b] <=> $scores[$a]; // descending score
             if ($cmp !== 0) return $cmp;
             if ($titleActive) {
-                $la = $docLengths[$a][$titleField] ?? PHP_INT_MAX;
-                $lb = $docLengths[$b][$titleField] ?? PHP_INT_MAX;
+                $la = $docLengths[$titleField][$a] ?? PHP_INT_MAX;
+                $lb = $docLengths[$titleField][$b] ?? PHP_INT_MAX;
                 $cmp = $la <=> $lb; // ascending title token count
                 if ($cmp !== 0) return $cmp;
             }
@@ -3009,6 +3064,13 @@ class Searcher
         $positiveIds = array_keys(array_filter($scores, fn($s) => $s > 0));
         $total       = count($positiveIds);
         $pagedIds    = array_slice($positiveIds, ($page - 1) * $perPage, $perPage);
+
+        // Per-field breakdown for the page only — see $scoreOne above.
+        foreach ($pagedIds as $docId) {
+            $r = $scoreOne($docId);
+            $fieldScores[$docId] = $r['fields'];
+            $matches[$docId]     = $r['matches'];
+        }
 
         // --- Fetch titles + snippets for paged results ---
         // Load display data for the current page only (typically 10-20 docs):
@@ -3280,7 +3342,7 @@ class Searcher
             $found = false;
             foreach (array_keys($fields) as $field) {
                 foreach ($expansions as $exp) {
-                    if (isset($fieldPostings[$field][$docId][$exp])) {
+                    if (isset($fieldPostings[$field][$exp][$docId])) {
                         $found = true;
                         break 2;
                     }
@@ -3309,14 +3371,14 @@ class Searcher
         if (isset($excludedDocIds[$docId])) return false;
         foreach (array_keys($fields) as $field) {
             foreach ($excByField[$field] as $excTerm) {
-                if (isset($fieldPostings[$field][$docId][$excTerm])) return false;
+                if (isset($fieldPostings[$field][$excTerm][$docId])) return false;
             }
         }
         foreach ($excPhrases as $group) {
             foreach (array_keys($fields) as $field) {
                 $all = true;
                 foreach ($group as $w) {
-                    if (!isset($fieldPostings[$field][$docId][$w])) { $all = false; break; }
+                    if (!isset($fieldPostings[$field][$w][$docId])) { $all = false; break; }
                 }
                 if ($all) return false;
             }
@@ -3440,7 +3502,8 @@ class Searcher
     // properties, which couldn't honor per-search 'ranking' overrides. Empty
     // array = fall back to the instance profile.
     private function scoreDoc(
-        array $docPostings,
+        array $fieldPost,        // [term => [docId => tf]] for one field (term-major)
+        string|int $docId,
         array $scoreTerms,
         string $algo,
         array $fStats,
@@ -3460,7 +3523,7 @@ class Searcher
         // 'total' => Σ concept weights] — concept-based coverage accounting
         // (see the 'concept_coverage' ranking flag). null = per-term (default).
         if (empty($rk)) $rk = $this->ranking;
-        if (empty($scoreTerms) || empty($docPostings)) {
+        if (empty($scoreTerms) || empty($fieldPost)) {
             return ['score' => 0.0, 'matches' => []];
         }
 
@@ -3486,7 +3549,7 @@ class Searcher
         $wildRarest     = [];   // idf only: wildcard prefix concept => idf x boost of its rarest matched completion
 
         foreach ($scoreTerms as $term) {
-            $tf = $docPostings[$term] ?? 0;
+            $tf = $fieldPost[$term][$docId] ?? 0;
             if ($tf === 0) continue;
 
             $matchedTerms[] = $term;
@@ -4287,11 +4350,29 @@ class Searcher
      */
     private function fetchPostingsForDocs(string $field, array $terms, array $docIds, int $rowsEstimate = 0): array
     {
-        if (empty($terms) || empty($docIds)) return [];
+        if (empty($terms) || empty($docIds)) return [[], []];
         $table  = "postings_$field";
         $terms  = array_values(array_unique($terms));
         $docIds = array_values($docIds);
-        $out    = [];
+        // Returns [[term => [docId => freq]], [docId => true]] — the postings
+        // term-major, plus the set of docs that have at least one row in
+        // this field. It was [docId => [term => freq]]: one small
+        // string-keyed hash per doc (~470 bytes at the typical 1-2 terms),
+        // 94 MB for the 198K (doc, field) entries of an exhaustive "the
+        // united states of america"; term-major is ~70 int-keyed arrays per
+        // field, ~15 MB for the same 285K cells. Readers all know the term
+        // they are asking about, so the lookup is [$term][$docId] instead of
+        // [$docId][$term].
+        //
+        // The presence set exists because the scorers probe every expanded
+        // term (~70 on that query) per doc per field. Doc-major gave them a
+        // free "no row for this doc in this field" exit (an empty array);
+        // without it term-major probed 70 terms x 3 fields for all 127K docs
+        // and the score loop went from 2.5s to 4.5s. The set costs ~49
+        // bytes per doc per field (10 MB at that size) and brings the
+        // early exit back.
+        $out     = [];
+        $present = [];
 
         // Scan mode: when the terms' total postings are fewer than the
         // (term, doc) pairs we would otherwise probe, range-scan the terms
@@ -4304,10 +4385,11 @@ class Searcher
                 $stmt->execute($batch);
                 while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
                     if (!isset($want[$row[0]])) continue;
-                    $out[$row[0]][$row[1]] = (int)$row[2];
+                    $out[$row[1]][$row[0]] = (int)$row[2];
+                    $present[$row[0]] = true;
                 }
             }
-            return $out;
+            return [$out, $present];
         }
 
         // Seek mode, ids sorted so the probes walk the B-tree in order.
@@ -4326,11 +4408,12 @@ class Searcher
                 );
                 $stmt->execute(array_merge($termBatch, $docBatch));
                 while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
-                    $out[$row[0]][$row[1]] = (int)$row[2];
+                    $out[$row[1]][$row[0]] = (int)$row[2];
+                    $present[$row[0]] = true;
                 }
             }
         }
-        return $out;
+        return [$out, $present];
     }
 
     /**
@@ -4486,6 +4569,12 @@ class Searcher
     // }
     //
     // Now: single doclens table with columns for all fields. One SQL round-trip.
+    //
+    // Returns [field => [docId => length]], one flat int-keyed array per
+    // field. It was [docId => [field => length]] — one tiny hash per doc,
+    // ~425 bytes each (8-bucket minimum), 52 MB for the 127K candidates of an
+    // exhaustive "the united states of america"; field-major is ~18 MB for
+    // the same data and every consumer already knew the field it wanted.
     private function fetchDocLengths(array $docIds, array $fields): array
     {
         if (empty($docIds) || empty($fields)) return [];
@@ -4505,7 +4594,7 @@ class Searcher
             $stmt->execute($batch);
             while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
                 foreach ($fields as $field) {
-                    $out[$row['doc_id']][$field] = (int)($row["len_$field"] ?? 0);
+                    $out[$field][$row['doc_id']] = (int)($row["len_$field"] ?? 0);
                 }
             }
         }

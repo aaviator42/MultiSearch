@@ -680,6 +680,23 @@ $perfTests = [
 	 'opts' => ['candidate_limit' => 0],
 	 'expect_min' => 40, 'max_time' => 6.0,
 	 'note' => 'Exhaustive phrase: 70K survivor ids go to SQLite in chunks (one IN list hit the 32,766-variable cap)'],
+	// Exhaustive on a broad optional query scores every matched doc — 127K
+	// here — so per-doc memory is what these two bound. Measured 74-83 MB
+	// after the per-candidate arrays were reduced to one float (scores),
+	// term-major postings plus a presence set, and field-major doc lengths;
+	// the earlier shape (a per-field breakdown, match lists and a doc-length
+	// hash for every candidate, doc-major postings) peaked at 300 MB for
+	// cover and 367 MB for rrf, which is what killed a 128 MB-limit host.
+	['id' => 'perf-mem-exhaustive-broad',
+	 'query' => 'the united states of america', 'confidence' => 70, 'algo' => 'auto', 'stemming' => true,
+	 'opts' => ['candidate_limit' => 0],
+	 'expect_min' => 100000, 'max_mem_mb' => 130, 'max_time' => 12.0,
+	 'note' => 'Every matched doc scored (127K): memory must stay near one float per doc, not one hash per doc'],
+	['id' => 'perf-mem-exhaustive-broad-rrf',
+	 'query' => 'the united states of america', 'confidence' => 70, 'algo' => 'rrf', 'stemming' => true,
+	 'opts' => ['candidate_limit' => 0],
+	 'expect_min' => 100000, 'max_mem_mb' => 130, 'max_time' => 15.0,
+	 'note' => 'Same, for the fusion path: two flat component arrays sorted in place, no rank maps'],
 	['id' => 'perf-wildcard-required-prefix',
 	 'query' => '+s*', 'confidence' => 100, 'algo' => 'auto',
 	 'expect_min' => 4000, 'max_time' => 6.0, 'max_mem_mb' => 80,
