@@ -1,0 +1,379 @@
+MultiSearch Test Suite
+2026-09-10 19:46:21
+============================================================================
+266 tests: ranking(90) fuzzy(12) routing(7) syntax(32) features(12) performance(13) real-world(10) expansion(15) positional(12) folding(9) comparison(54) 
+Index: data/wikipedia.db  |  positions: YES (adjacency phrase semantics)  |  diacritics: FOLDED
+----------------------------------------------------------------------------
+Engine 3.7  |  PHP 8.3.13  |  memory_limit 512M  |  index built 2026-08-24T22:57:10+00:00, 282,905 docs, tokenizer multisearch-fold-v1
+Corpus profile: config/corpus-wikipedia.php  |  fields title 3 · opening 2 · body 1  |  title_field title  |  heavy_fields body  |  field_b {"title":0.3,"opening":0.5,"body":0.75}
+WordNet: data/oewn.db ready  |  stem_verifier on (OEWN)  |  stopword list 118 words (only when a test asks)
+Recall caps: candidate_limit 5000 · phase1_limit 1000 · highfreq_cutoff 0.25 · max_fuzzy_per_term 10 · max_wildcard_expansions 100 · wildcard_row_budget 200000 · broad_cap 20000
+Ranking knobs: k1 1.5 · b 0.75 · delta 0.5 · rrf_k 60 · proximity_weight 0.3 · title_bonus_base 1.5 · title_bonus_span 1.5 · title_bonus_half 1.3 · title_bonus_partial 1.1 · fuzzy_decay 0.5 · typo_swap_ratio 10 · swap_context_check 0.3 · swap_orig_df_max 20 · swap_zero_df_promote 100 · noise_exempt_promoted on · title_promoted_as_form on · auto_typo_fraction 0 · auto_wildcard_algo freq · auto_typo_algo freq · auto_question_algo freq · auto_single_word_algo freq · auto_default_algo cover · freq_tf_log on · concept_coverage on · stem_boost 0.8 · derivation_boost 0.7 · morph_boost 0.7 · snippet_length 300
+Per-test defaults: confidence 100 (fuzzy off) · per_page 20 · stemming, stopwords, synonyms, derivations OFF unless the test sets them · algo: section default (bm25 unless a test pins one) · positions on
+Labeled study: every query x 9 algos · confidence 85 · stemming on · no stopwords, no WordNet · per_page 50
+============================================================================
+
+── TOKENIZER ─────────────────────────────────────────────────────────────
+  plain  tok-basic                                  OK
+  plain  tok-keep-accents                           OK
+  fold   tok-fold-latin1                            OK
+  fold   tok-fold-multi                             OK
+  fold   tok-fold-ext                               OK
+  fold   tok-fold-decomp                            OK
+  fold   tok-fold-turkish                           OK
+  fold   tok-fold-nonlatin                          OK
+  fold   tok-fold-ascii-fastpath                    OK
+
+── RANKING ───────────────────────────────────────────────────────────────
+  bm25   rank-einstein-bm25                         OK      0.145s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(75.2211), "Elsa Einstein"(32.2011)
+  cover  rank-einstein-cover                        OK      0.123s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(72.2222), "Albert"(32.5)
+  idf    rank-einstein-idf                          OK      0.121s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(69.2734), "Bose–Einstein condensate"(34.125)
+  freq   rank-einstein-freq                         OK      0.125s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(55.4836), "Bose–Einstein condensate"(28.0315)
+  bm25+cov rank-einstein-bm25+cov                     OK      0.129s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(75.2211), "Elsa Einstein"(27.6181)
+  bm25f  rank-einstein-bm25f                        OK      0.204s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(64.5943), "Bose–Einstein condensate"(32.5328)
+  rrf    rank-einstein-rrf                          OK      0.135s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(72.2222), "Elsa Einstein"(41.3375)
+  dfr    rank-einstein-dfr                          OK      0.131s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(77.9574), "Elsa Einstein"(32.9308)
+  auto   rank-einstein-auto                         OK      0.125s    2949 hits  "Albert Einstein"(100), "Albert Einstein Square"(72.2222), "Albert"(32.5)
+  bm25   rank-bob-einstein-bm25                     OK      0.132s    4204 hits  "Bob Einstein"(100), "Arik Einstein"(24.0858), "Albert Einstein"(23.0694)
+  cover  rank-bob-einstein-cover                    OK      0.128s    4204 hits  "Bob Einstein"(100), "Bob"(21.6667), "Albert Einstein"(21.6667)
+  idf    rank-bob-einstein-idf                      OK      0.135s    4204 hits  "Bob Einstein"(100), "Bose–Einstein condensate"(28.3127), "Albert Einstein"(27.4003)
+  freq   rank-bob-einstein-freq                     OK      0.143s    4204 hits  "Bob Einstein"(100), "Bob"(49.9315), "Albert Einstein"(43.8969)
+  bm25+cov rank-bob-einstein-bm25+cov                 OK      0.137s    4204 hits  "Bob Einstein"(100), "Arik Einstein"(15.0536), "Albert Einstein"(14.4184)
+  bm25f  rank-bob-einstein-bm25f                    OK      0.245s    4204 hits  "Bob Einstein"(100), "Emmett Brown"(19.8592), "Father complex"(17.993)
+  rrf    rank-bob-einstein-rrf                      OK      0.142s    4204 hits  "Bob Einstein"(100), "Albert Einstein"(41.9577), "Bose–Einstein condensate"(39.532)
+  dfr    rank-bob-einstein-dfr                      OK      0.131s    4204 hits  "Bob Einstein"(100), "Bob"(21.9423), "Albert Einstein"(20.3744)
+  auto   rank-bob-einstein-auto                     OK      0.131s    4204 hits  "Bob Einstein"(100), "Bob"(21.6667), "Albert Einstein"(21.6667)
+  bm25   rank-python-myth-bm25                      OK      0.048s    1744 hits  "Python (mythology)"(100), "Python"(24.579), "Python molurus"(23.848)
+  cover  rank-python-myth-cover                     OK      0.051s    1744 hits  "Python (mythology)"(100), "Python"(21.6667), "Monty Python"(21.6667)
+  idf    rank-python-myth-idf                       OK      0.047s    1744 hits  "Python (mythology)"(100), "Python"(24.7503), "Monty Python"(24.7503)
+  freq   rank-python-myth-freq                      OK      0.045s    1744 hits  "Python (mythology)"(100), "Python"(46.0854), "Python (programming langu"(45.1805)
+  bm25+cov rank-python-myth-bm25+cov                  OK      0.046s    1744 hits  "Python (mythology)"(100), "Python"(15.3619), "Python molurus"(14.905)
+  bm25f  rank-python-myth-bm25f                     OK      0.048s    1744 hits  "Python (mythology)"(100), "Poubi Lai"(25.6153), "Paphal"(19.6676)
+  rrf    rank-python-myth-rrf                       OK      0.053s    1744 hits  "Python (mythology)"(100), "Age of Mythology"(36.9697), "Jupiter (mythology)"(35.5012)
+  dfr    rank-python-myth-dfr                       OK      0.054s    1744 hits  "Python (mythology)"(100), "Python"(21.199), "Māori mythology"(20.4482)
+  auto   rank-python-myth-auto                      OK      0.049s    1744 hits  "Python (mythology)"(100), "Python"(21.6667), "Monty Python"(21.6667)
+  bm25   fuzzy-smart-vs-shart-bm25                  OK      0.105s    1433 hits  "Smart"(100), "SMart"(94.9471), "Smart Technologies"(57.877)
+  cover  fuzzy-smart-vs-shart-cover                 OK      0.079s    1433 hits  "SMart"(100), "Smart"(100), "Elizabeth Smart"(62.5)
+  idf    fuzzy-smart-vs-shart-idf                   OK      0.071s    1433 hits  "SMart"(100), "Smart"(100), "Elizabeth Smart"(62.5)
+  freq   fuzzy-smart-vs-shart-freq                  OK      0.073s    1433 hits  "Smart"(100), "SMart"(75.5789), "Get Smart"(72.7561)
+  bm25+cov fuzzy-smart-vs-shart-bm25+cov              OK      0.069s    1433 hits  "Smart"(100), "SMart"(94.9471), "Smart Technologies"(57.877)
+  bm25f  fuzzy-smart-vs-shart-bm25f                 OK      0.099s    1433 hits  "Smart"(100), "SMart"(98.945), "Smart Technologies"(62.8849)
+  rrf    fuzzy-smart-vs-shart-rrf                   OK      0.103s    1433 hits  "SMart"(100), "Smart"(92.8902), "Get Smart"(61.0313)
+  dfr    fuzzy-smart-vs-shart-dfr                   OK      0.075s    1433 hits  "Smart"(100), "SMart"(95.8503), "Smart Technologies"(58.453)
+  auto   fuzzy-smart-vs-shart-auto                  OK      0.071s    1433 hits  "Smart"(100), "SMart"(75.5789), "Get Smart"(72.7561)
+  bm25   fuzzy-einstein-typo-bm25                   OK      0.034s     315 hits  "Arik Einstein"(100), "Bob Einstein"(95.7085), "Elsa Einstein"(95.3164)
+  cover  fuzzy-einstein-typo-cover                  OK      0.035s     315 hits  "Albert Einstein"(100), "Elsa Einstein"(100), "Arik Einstein"(100)
+  idf    fuzzy-einstein-typo-idf                    OK      0.034s     315 hits  "Albert Einstein"(100), "Elsa Einstein"(100), "Arik Einstein"(100)
+  freq   fuzzy-einstein-typo-freq                   OK      0.033s     315 hits  "Albert Einstein"(100), "Bose–Einstein condensate"(78.6558), "Albert Einstein Square"(64.271)
+  bm25+cov fuzzy-einstein-typo-bm25+cov               OK      0.032s     315 hits  "Arik Einstein"(100), "Bob Einstein"(95.7085), "Elsa Einstein"(95.3164)
+  bm25f  fuzzy-einstein-typo-bm25f                  OK      0.037s     315 hits  "Bose–Einstein condensate"(100), "Arik Einstein"(91.9171), "Bob Einstein"(91.0247)
+  rrf    fuzzy-einstein-typo-rrf                    OK      0.039s     315 hits  "Elsa Einstein"(100), "Arik Einstein"(99.4311), "Albert Einstein"(97.082)
+  dfr    fuzzy-einstein-typo-dfr                    OK      0.033s     315 hits  "Arik Einstein"(100), "Elsa Einstein"(97.1672), "Bob Einstein"(97.1231)
+  auto   fuzzy-einstein-typo-auto                   OK      0.034s     315 hits  "Albert Einstein"(100), "Bose–Einstein condensate"(78.6558), "Albert Einstein Square"(64.271)
+  bm25   rank-solar-system-bm25                     OK      0.182s    5000 hits  "Solar System"(100), "Small solar system body"(58.9704), "List of Solar System obje"(49.0895)
+  cover  rank-solar-system-cover                    OK      0.164s    5000 hits  "Solar System"(100), "Small solar system body"(62.5), "List of Solar System obje"(58)
+  idf    rank-solar-system-idf                      OK      0.189s    5000 hits  "Solar System"(100), "Small solar system body"(62.5), "List of Solar System obje"(58)
+  freq   rank-solar-system-freq                     OK      0.170s    5000 hits  "Solar System"(100), "Small solar system body"(38.8866), "Formation and evolution o"(38.7046)
+  bm25+cov rank-solar-system-bm25+cov                 OK      0.167s    5000 hits  "Solar System"(100), "Small solar system body"(58.9704), "List of Solar System obje"(49.0895)
+  bm25f  rank-solar-system-bm25f                    OK      0.185s    5000 hits  "Solar System"(100), "Small solar system body"(62.3965), "List of Solar System obje"(54.1203)
+  rrf    rank-solar-system-rrf                      OK      0.186s    5000 hits  "Solar System"(100), "Small solar system body"(61.4919), "List of Solar System obje"(56.1587)
+  dfr    rank-solar-system-dfr                      OK      0.168s    5000 hits  "Solar System"(100), "Small solar system body"(59.4424), "List of Solar System obje"(49.6737)
+  auto   rank-solar-system-auto                     OK      0.179s    5000 hits  "Solar System"(100), "Small solar system body"(62.5), "List of Solar System obje"(58)
+  bm25   rank-quantum-bm25                          OK      0.030s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(53.1617), "Quantum biology"(29.9455)
+  cover  rank-quantum-cover                         OK      0.028s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(62.5), "Classical mechanics"(32.5)
+  idf    rank-quantum-idf                           OK      0.028s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(62.5), "Classical mechanics"(30.967)
+  freq   rank-quantum-freq                          OK      0.028s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(39.753), "Quantum biology"(35.2772)
+  bm25+cov rank-quantum-bm25+cov                      OK      0.029s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(53.1617), "Quantum biology"(26.3491)
+  bm25f  rank-quantum-bm25f                         OK      0.029s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(58.353), "Quantum nonlocality"(39.128)
+  rrf    rank-quantum-rrf                           OK      0.032s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(61.4919), "Quantum entanglement"(40.6763)
+  dfr    rank-quantum-dfr                           OK      0.034s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(53.5234), "Quantum biology"(30.807)
+  auto   rank-quantum-auto                          OK      0.029s     939 hits  "Quantum mechanics"(100), "Interpretations of quantu"(62.5), "Classical mechanics"(32.5)
+  bm25   rank-violet-bm25                           OK      0.013s     314 hits  "Violet"(100), "Violet (color)"(56.1808), "Red-violet"(53.5109)
+  cover  rank-violet-cover                          OK      0.013s     314 hits  "Violet"(100), "Violet (color)"(62.5), "Violet (plant)"(62.5)
+  idf    rank-violet-idf                            OK      0.013s     314 hits  "Violet"(100), "Violet (color)"(62.5), "Violet (plant)"(62.5)
+  freq   rank-violet-freq                           OK      0.014s     314 hits  "Violet"(100), "Violet (color)"(99.1559), "Red-violet"(92.0652)
+  bm25+cov rank-violet-bm25+cov                       OK      0.014s     314 hits  "Violet"(100), "Violet (color)"(56.1808), "Red-violet"(53.5109)
+  bm25f  rank-violet-bm25f                          OK      0.016s     314 hits  "Violet"(100), "Violet (color)"(62.9369), "Red-violet"(61.1439)
+  rrf    rank-violet-rrf                            OK      0.014s     314 hits  "Violet"(100), "Violet (color)"(65.8111), "Violet (plant)"(64.2561)
+  dfr    rank-violet-dfr                            OK      0.012s     314 hits  "Violet"(100), "Violet (color)"(57.5766), "Red-violet"(56.6061)
+  auto   rank-violet-auto                           OK      0.013s     314 hits  "Violet"(100), "Violet (color)"(99.1559), "Red-violet"(92.0652)
+  bm25   rank-monty-python-bm25                     OK      0.022s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(41.1123), "Monty Python's Life of Br"(23.6298)
+  cover  rank-monty-python-cover                    OK      0.022s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(55.5556), "Python (programming langu"(32.5)
+  idf    rank-monty-python-idf                      OK      0.023s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(55.5556), "Python (programming langu"(31.3256)
+  freq   rank-monty-python-freq                     OK      0.020s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(36.541), "Python (programming langu"(31.8217)
+  bm25+cov rank-monty-python-bm25+cov                 OK      0.014s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(41.1123), "Monty Python's Life of Br"(21.2336)
+  bm25f  rank-monty-python-bm25f                    OK      0.015s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(48.2373), "Monty Python's Life of Br"(34.0268)
+  rrf    rank-monty-python-rrf                      OK      0.015s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(54.6595), "Monty Python's Life of Br"(41.9577)
+  dfr    rank-monty-python-dfr                      OK      0.015s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(42.0036), "Monty Python's Life of Br"(25.1108)
+  auto   rank-monty-python-auto                     OK      0.015s     350 hits  "Monty Python"(100), "Monty Python and the Holy"(55.5556), "Python (programming langu"(32.5)
+  bm25   rank-water-bm25                            OK      0.139s    5000 hits  "Water"(100), "Bottled water"(59.7333), "Fresh water"(58.8013)
+  cover  rank-water-cover                           OK      0.152s    5000 hits  "Water"(100), "Water cycle"(62.5), "Water vapor"(62.5)
+  idf    rank-water-idf                             OK      0.184s    5000 hits  "Water"(100), "Water cycle"(62.5), "Water vapor"(62.5)
+  freq   rank-water-freq                            OK      0.152s    5000 hits  "Water"(100), "Fresh water"(44.4183), "Water scarcity"(41.8756)
+  bm25+cov rank-water-bm25+cov                        OK      0.151s    5000 hits  "Water"(100), "Bottled water"(59.7333), "Fresh water"(58.8013)
+  bm25f  rank-water-bm25f                           OK      0.155s    5000 hits  "Water"(100), "Fresh water"(63.3992), "Bottled water"(63.3426)
+  rrf    rank-water-rrf                             OK      0.166s    5000 hits  "Water"(100), "Salt water"(58.2095), "Water vapor"(56.7336)
+  dfr    rank-water-dfr                             OK      0.138s    5000 hits  "Water"(100), "Water extraction"(58.8007), "Carbonated water"(58.7497)
+  auto   rank-water-auto                            OK      0.159s    5000 hits  "Water"(100), "Fresh water"(44.4183), "Water scarcity"(41.8756)
+── FUZZY ─────────────────────────────────────────────────────────────────
+  bm25   fuzzy-dinasaur                             OK      0.057s     684 hits
+  bm25   fuzzy-elefant                              OK      0.031s     197 hits
+  bm25   fuzzy-exact-at-100                         OK      0.022s     683 hits
+  bm25   fuzzy-nonsense                             OK      0.002s       0 hits
+  bm25   fuzzy-multiword                            OK      0.070s     501 hits
+  bm25   fuzzy-boost-ordering                       OK      0.070s    1433 hits
+  auto   fuzzy-numeric-exact                        OK      0.201s    5000 hits
+  auto   fuzzy-alphanumeric-exact                   OK      0.048s     436 hits
+  auto   fuzzy-numeric-year                         OK      0.151s    5000 hits
+  auto   fuzzy-zero-prefix-word                     OK      0.165s    5000 hits
+  auto   fuzzy-zero-prefix-bond                     OK      0.013s     264 hits
+  auto   fuzzy-bare-zero                            OK      0.185s    5000 hits
+── ROUTING ───────────────────────────────────────────────────────────────
+  auto   route-clean-cover                          OK      0.141s    2949 hits
+  auto   route-typo-freq                            OK      0.035s     315 hits
+  auto   route-single-word-freq                     OK      0.016s     365 hits
+  auto   route-single-word-excluded                 OK      0.011s     184 hits
+  auto   route-question-freq                        OK      0.392s    5000 hits
+  auto   route-multi-word-cover                     OK      0.176s    5000 hits
+  auto   route-knob-override                        OK      0.071s    2466 hits
+── SYNTAX ────────────────────────────────────────────────────────────────
+  bm25   syntax-required                            OK      0.025s     683 hits
+  bm25   syntax-excluded                            OK      0.258s    4569 hits
+  bm25   syntax-phrase                              OK      0.628s    4929 hits
+  bm25   syntax-boost                               OK      0.016s     434 hits
+  bm25   syntax-wildcard                            OK      0.156s    5000 hits
+  bm25   syntax-req-wildcard                        OK      0.221s    3534 hits
+  bm25   syntax-excluded-only                       OK      0.000s       0 hits
+  bm25   syntax-all-required                        OK      0.005s       8 hits
+  auto   syntax-required-common-word                OK      0.702s    5000 hits
+  auto   syntax-required-rare-plus-common           OK      0.040s     317 hits
+  auto   syntax-required-not-sampled                OK      0.012s     313 hits
+  auto   syntax-phrase-all-stopwords                OK      1.111s    3785 hits
+  auto   syntax-excluded-stopword                   OK      0.066s       4 hits
+  auto   syntax-excluded-many-stopwords             OK      0.027s       0 hits
+  auto   syntax-quoted-word-exact-set               OK      0.157s    4709 hits
+  auto   syntax-wildcard-commonest                  OK      0.579s    5000 hits
+  auto   syntax-wildcard-united                     OK      0.954s    5000 hits
+  auto   syntax-wildcard-inter                      OK      0.389s    5000 hits
+  auto   syntax-wildcard-photo                      OK      0.194s    5000 hits
+  auto   syntax-wildcard-with-word                  OK      2.366s    5000 hits
+  auto   syntax-wildcard-world-war                  OK      0.591s    5000 hits
+  auto   syntax-wildcard-john-smith                 OK      0.339s    5000 hits
+  auto   syntax-wildcard-budget-off                 OK      0.424s    5000 hits
+  idf    syntax-wildcard-rarity-tail                OK      0.190s    5000 hits
+  idf    syntax-wildcard-rarity-neuro               OK      0.058s    1218 hits
+  idf    syntax-wildcard-rarity-with-word           OK      2.210s    5000 hits
+  auto   syntax-compound-decimal                    OK      0.422s      67 hits
+  auto   syntax-compound-date                       OK      0.179s      36 hits
+  auto   syntax-compound-off                        OK      0.372s    5000 hits
+  auto   syntax-required-one-letter                 OK      0.145s    5000 hits
+  auto   syntax-wildcard-hyphenated                 OK      0.113s    3609 hits
+  auto   syntax-excluded-wildcard-complete          OK      0.314s    4444 hits
+── FEATURES ──────────────────────────────────────────────────────────────
+  bm25   feat-stemming                              OK      0.169s    5000 hits
+  bm25   feat-stopwords                             OK      0.134s    5000 hits
+  bm25   feat-stopwords-all                         OK      0.000s       0 hits
+  bm25   feat-synonyms                              OK      0.077s    2943 hits
+  bm25   feat-synonyms-recall                       OK      0.012s     311 hits
+  bm25   feat-synonyms-off-baseline                 OK      0.005s      31 hits
+  bm25   feat-synonyms-optional-only                OK      0.005s      31 hits
+  bm25   feat-synonyms-typed-wins                   OK      0.116s    4663 hits
+  bm25   feat-synonyms-senses                       OK      0.150s    5000 hits
+  bm25   feat-synonyms-senses-primary               OK      0.115s    4803 hits
+  bm25   feat-stem-fuzzy                            OK      0.188s    5000 hits
+  bm25   feat-all-combined                          OK      0.164s    3715 hits
+── PERFORMANCE ───────────────────────────────────────────────────────────
+  bm25   perf-common-word                           OK      0.157s    5000 hits
+  bm25   perf-long-query                            OK      1.160s    5000 hits
+  bm25   perf-single-char                           OK      0.074s    2910 hits
+  bm25   perf-wildcard-broad                        OK      0.878s    5000 hits
+  bm25   perf-fuzzy-multiword                       OK      0.160s    3040 hits
+  bm25   perf-exact-simple                          OK      0.168s    5000 hits
+  bm25   perf-fuzzy-typo                            OK      0.030s     315 hits
+  auto   perf-mem-phrase-stopwords                  OK      1.181s     607 hits
+  auto   perf-mem-three-common-words                OK      0.671s    5000 hits
+  auto   perf-mem-long-optional                     OK      1.612s    5000 hits
+  auto   perf-exhaustive-phrase                     OK      1.196s     124 hits
+  auto   perf-wildcard-required-prefix              OK      3.143s    5000 hits
+  auto   perf-wildcard-single-letter                OK      2.459s    5000 hits
+── REAL-WORLD ────────────────────────────────────────────────────────────
+  bm25   rw-single-word                             OK      0.011s     176 hits
+  bm25   rw-question-what                           OK      0.185s    5000 hits
+  bm25   rw-question-who                            OK      0.294s    5000 hits
+  bm25   rw-partial-name                            OK      0.018s     501 hits
+  bm25   rw-topic-qualifier                         OK      0.090s    3070 hits
+  bm25   rw-geography                               OK      0.072s    2378 hits
+  bm25   rw-multi-typo                              OK      0.128s    2547 hits
+  bm25   rw-broad-topic                             OK      0.413s    5000 hits
+  bm25   rw-abbreviation                            OK      0.032s    1132 hits
+  bm25   rw-disambig                                OK      0.030s     895 hits
+── EXPANSION ─────────────────────────────────────────────────────────────
+  bm25   exp-stem-req-or                            OK      0.065s    1776 hits
+  bm25   exp-stem-concept-title                     OK      0.056s    1776 hits
+  bm25   exp-stem-irregular                         OK      0.203s    5000 hits
+  bm25   exp-stem-doubled                           OK      0.269s    5000 hits
+  bm25   exp-tok-apostrophe                         OK      0.104s    2939 hits
+  bm25   exp-tok-hyphen                             OK      0.021s     553 hits
+  bm25   exp-excl-wildcard                          OK      0.398s    4444 hits
+  bm25   exp-stem-risky-verified                    OK      0.127s    3881 hits
+  bm25   exp-stem-risky-guard                       OK      0.183s    5000 hits
+  bm25   exp-derivations                            OK      0.077s    3115 hits
+  bm25   exp-derivations-govern                     OK      0.063s    1684 hits
+  bm25   exp-excl-phrase-and                        OK      0.484s    3869 hits
+  auto   exp-auto-stem-question                     OK      0.471s    5000 hits
+  auto   exp-auto-typo-still-freq                   OK      0.053s     315 hits
+  bm25   exp-combo-kitchen-sink                     OK      0.056s      65 hits
+── POSITIONAL ────────────────────────────────────────────────────────────
+  bm25   pos-entity-phrase                          OK      0.073s     530 hits
+  bm25   pos-compositional-phrase                   OK      0.039s     165 hits
+  bm25   pos-hyphen-phrase                          OK      0.031s     439 hits
+  bm25   pos-threeword-phrase                       OK      0.579s    4383 hits
+  bm25   pos-reversed-order                         OK      0.060s       1 hits
+  bm25   pos-reversed-trap-cap                      OK      0.383s      27 hits
+  bm25   pos-excl-precision                         OK      0.018s     121 hits
+  bm25   pos-mode-escape-hatch                      OK      0.049s     687 hits
+  bm25   pos-capture-excl-broad                     OK      0.312s    2761 hits
+  bm25   pos-capture-slop-filter                    OK      0.072s     474 hits
+  bm25   pos-perf-phrase-at-cap                     OK      0.633s    4929 hits
+  bm25   pos-perf-excl-common-words                 OK      0.484s    4421 hits
+── FOLDING ───────────────────────────────────────────────────────────────
+  bm25   fold-sao-paulo                             OK      0.074s    1461 hits
+  bm25   fold-sao-paulo-accented                    OK      0.063s    1461 hits
+  bm25   fold-pokemon                               OK      0.034s     224 hits
+  bm25   fold-francois                              OK      0.067s    1144 hits
+  bm25   fold-phrase                                OK      0.081s     820 hits
+  bm25   fold-wildcard                              OK      0.036s     716 hits
+  bm25   fold-fuzzy-still-works                     OK      0.074s     229 hits
+  bm25   fold-strasse                               OK      0.009s      51 hits
+  bm25   fold-ascii-unchanged                       OK      0.089s    2466 hits
+── COMPARISON ────────────────────────────────────────────────────────────
+  bm25   cmp-climate-bm25                           OK      0.272s    5000 hits  "Global warming"(100), "Climate change"(97.399), "United Kingdom Climate Ch"(95.5939)
+  cover  cmp-climate-cover                          OK      0.236s    5000 hits  "Global warming"(100), "Climate change"(100), "United Kingdom Climate Ch"(100)
+  idf    cmp-climate-idf                            OK      0.224s    5000 hits  "Global warming"(100), "Climate change"(92.7416), "United Kingdom Climate Ch"(92.7416)
+  freq   cmp-climate-freq                           OK      0.349s    5000 hits  "Global warming"(100), "Intergovernmental Panel o"(63.654), "Climate change"(61.3818)
+  bm25+cov cmp-climate-bm25+cov                       OK      0.519s    5000 hits  "United Kingdom Climate Ch"(100), "Global warming"(97.6597), "Climate change"(97.6513)
+  bm25f  cmp-climate-bm25f                          OK      0.544s    5000 hits  "Global warming"(100), "United Kingdom Climate Ch"(99.9188), "Climate change"(95.8021)
+  rrf    cmp-climate-rrf                            OK      0.303s    5000 hits  "Climate change"(100), "Global warming"(98.4502), "United Kingdom Climate Ch"(98.3998)
+  dfr    cmp-climate-dfr                            OK      0.282s    5000 hits  "Climate change"(100), "United Kingdom Climate Ch"(99.2594), "Global warming"(94.4934)
+  auto   cmp-climate-auto                           OK      0.171s    5000 hits  "Global warming"(100), "Climate change"(100), "United Kingdom Climate Ch"(100)
+  bm25   cmp-smart-bm25                             OK      0.073s    1433 hits  "Smart"(100), "SMart"(94.9471), "Smart Technologies"(57.877)
+  cover  cmp-smart-cover                            OK      0.072s    1433 hits  "SMart"(100), "Smart"(100), "Elizabeth Smart"(62.5)
+  idf    cmp-smart-idf                              OK      0.076s    1433 hits  "SMart"(100), "Smart"(100), "Elizabeth Smart"(62.5)
+  freq   cmp-smart-freq                             OK      0.084s    1433 hits  "Smart"(100), "SMart"(75.5789), "Get Smart"(72.7561)
+  bm25+cov cmp-smart-bm25+cov                         OK      0.071s    1433 hits  "Smart"(100), "SMart"(94.9471), "Smart Technologies"(57.877)
+  bm25f  cmp-smart-bm25f                            OK      0.103s    1433 hits  "Smart"(100), "SMart"(98.945), "Smart Technologies"(62.8849)
+  rrf    cmp-smart-rrf                              OK      0.081s    1433 hits  "SMart"(100), "Smart"(92.8902), "Get Smart"(61.0313)
+  dfr    cmp-smart-dfr                              OK      0.073s    1433 hits  "Smart"(100), "SMart"(95.8503), "Smart Technologies"(58.453)
+  auto   cmp-smart-auto                             OK      0.084s    1433 hits  "Smart"(100), "SMart"(75.5789), "Get Smart"(72.7561)
+  bm25   cmp-quantum-bm25                           OK      0.093s    1282 hits  "Tunnel"(100), "Wheeling Tunnel"(90.6108), "Tunnel construction"(88.7695)
+  cover  cmp-quantum-cover                          OK      0.076s    1282 hits  "Tunnel"(100), "Quantum"(100), "Quantum mechanics"(100)
+  idf    cmp-quantum-idf                            OK      0.077s    1282 hits  "Tunnel"(100), "Wheeling Tunnel"(100), "Tunnel construction"(100)
+  freq   cmp-quantum-freq                           OK      0.078s    1282 hits  "Tunnel"(100), "Quantum computer"(87.067), "Wheeling Tunnel"(84.8681)
+  bm25+cov cmp-quantum-bm25+cov                       OK      0.077s    1282 hits  "Tunnel"(100), "Wheeling Tunnel"(90.6108), "Tunnel construction"(88.7695)
+  bm25f  cmp-quantum-bm25f                          OK      0.120s    1282 hits  "La Línea (tunnel)"(100), "Large Hadron Collider"(95.0693), "Tunnel"(79.1399)
+  rrf    cmp-quantum-rrf                            OK      0.096s    1282 hits  "Tunnel"(100), "Wheeling Tunnel"(98.3871), "Tunnel construction"(96.0689)
+  dfr    cmp-quantum-dfr                            OK      0.079s    1282 hits  "Tunnel"(100), "Wheeling Tunnel"(91.943), "Tunnel construction"(90.8193)
+  auto   cmp-quantum-auto                           OK      0.075s    1282 hits  "Tunnel"(100), "Quantum"(100), "Quantum mechanics"(100)
+  bm25   cmp-python-bm25                            OK      0.015s     208 hits  "Python (programming langu"(100), "Python Software Foundatio"(47.7182), "Python License"(46.9241)
+  cover  cmp-python-cover                           OK      0.014s     208 hits  "Python (programming langu"(100), "Programming language"(45), "Computer programming"(45)
+  idf    cmp-python-idf                             OK      0.014s     208 hits  "Python (programming langu"(100), "Python License"(44.5418), "Python Software Foundatio"(44.5418)
+  freq   cmp-python-freq                            OK      0.014s     208 hits  "Python (programming langu"(100), "Programming language"(58.7106), "Object-oriented programmi"(53.2922)
+  bm25+cov cmp-python-bm25+cov                        OK      0.014s     208 hits  "Python (programming langu"(100), "Python Software Foundatio"(42.0644), "Python License"(40.6413)
+  bm25f  cmp-python-bm25f                           OK      0.015s     208 hits  "Python (programming langu"(100), "Python Software Foundatio"(55.2264), "Python License"(53.337)
+  rrf    cmp-python-rrf                             OK      0.016s     208 hits  "Python (programming langu"(100), "Python License"(58.5637), "Python Software Foundatio"(58.5637)
+  dfr    cmp-python-dfr                             OK      0.014s     208 hits  "Python (programming langu"(100), "Python Software Foundatio"(48.3382), "Python License"(48.273)
+  auto   cmp-python-auto                            OK      0.014s     208 hits  "Python (programming langu"(100), "Programming language"(45), "Computer programming"(45)
+  bm25   cmp-monster-bm25                           OK      0.108s    1377 hits  "Monster"(100), "Monster (disambiguation)"(65.9179), "Monster movie"(63.8065)
+  cover  cmp-monster-cover                          OK      0.108s    1377 hits  "Monster"(100), "Monster (movie)"(62.5), "Monster (disambiguation)"(62.5)
+  idf    cmp-monster-idf                            OK      0.093s    1377 hits  "Monster"(100), "Monster (movie)"(62.5), "Monster (disambiguation)"(62.5)
+  freq   cmp-monster-freq                           OK      0.099s    1377 hits  "Monster movie"(100), "Sea monster"(99.472), "Cookie Monster"(98.2053)
+  bm25+cov cmp-monster-bm25+cov                       OK      0.088s    1377 hits  "Monster"(100), "Monster (disambiguation)"(65.9179), "Monster movie"(63.8065)
+  bm25f  cmp-monster-bm25f                          OK      0.126s    1377 hits  "Monster"(100), "Monster Hunter"(66.5149), "Monster (disambiguation)"(65.6427)
+  rrf    cmp-monster-rrf                            OK      0.108s    1377 hits  "Monster"(100), "Monster (disambiguation)"(70.2532), "Gila monster"(68.5839)
+  dfr    cmp-monster-dfr                            OK      0.087s    1377 hits  "Monster"(100), "Monster (disambiguation)"(63.9473), "Gila monster"(63.3445)
+  auto   cmp-monster-auto                           OK      0.090s    1377 hits  "Monster movie"(100), "Sea monster"(99.472), "Cookie Monster"(98.2053)
+  bm25   cmp-phrase-coldwar-bm25                    OK      0.118s     586 hits  "Second Cold War"(100), "Cold War"(95.4745), "Cold war (term)"(88.7928)
+  cover  cmp-phrase-coldwar-cover                   OK      0.129s     586 hits  "Cold War"(100), "Cold War Kids"(92.3077), "Cold war (term)"(92.3077)
+  idf    cmp-phrase-coldwar-idf                     OK      0.121s     586 hits  "Cold War"(100), "Cold War Kids"(96.4765), "Cold war (term)"(96.4765)
+  freq   cmp-phrase-coldwar-freq                    OK      0.158s     586 hits  "World War II"(100), "Second Cold War"(92.9961), "History of Europe"(89.4773)
+  bm25+cov cmp-phrase-coldwar-bm25+cov                OK      0.167s     586 hits  "Cold War"(100), "Second Cold War"(98.9785), "Cold war (term)"(87.8858)
+  bm25f  cmp-phrase-coldwar-bm25f                   OK      0.170s     586 hits  "Cold War"(100), "European Coal and Steel C"(75.6668), "1st Army (France)"(74.3456)
+  rrf    cmp-phrase-coldwar-rrf                     OK      0.166s     586 hits  "Cold War"(100), "Second Cold War"(94.3322), "Cold War Kids"(93.9362)
+  dfr    cmp-phrase-coldwar-dfr                     OK      0.165s     586 hits  "Second Cold War"(100), "Cold War"(99.9193), "Cold war (term)"(90.558)
+  auto   cmp-phrase-coldwar-auto                    OK      0.161s     586 hits  "Cold War"(100), "Cold War Kids"(92.3077), "Cold war (term)"(92.3077)
+── RANKING-OVERRIDE ────────────────────────────────────────────────────────
+  bm25   feat-ranking-override                      OK      0.138s    1776 hits
+
+── LABELED RANKING STUDY (config: release-3.7) ────────────────
+  wikipeedia             absent-typo   auto=freq     r1   bm25:1 cove:1 idf:2 freq:1 bm25:1 bm25:2 rrf:1 dfr:1  [wikipeedia->wikipedia]
+  beethovan              absent-typo   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1  [beethovan->beethoven]
+  pyramyd                absent-typo   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1  [pyramyd->pyramid]
+  phyisics               absent-typo   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1  [phyisics->physics]
+  libary                 absent-typo   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1  [libary->library]
+  restraunt              absent-typo   auto=freq     r-   bm25:- cove:- idf:- freq:- bm25:- bm25:- rrf:- dfr:-
+  einstien               corpus-typo   auto=freq     r1   bm25:5 cove:1 idf:1 freq:1 bm25:5 bm25:6 rrf:3 dfr:5  [einstien->einstein]
+  girafe                 corpus-typo   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1  [girafe->giraffe]
+  volcanoe               corpus-typo   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1  [volcanoe->volcano]
+  shakespear             corpus-typo   auto=freq     r1   bm25:2 cove:3 idf:2 freq:1 bm25:2 bm25:3 rrf:2 dfr:2  [shakespear->shakespeare]
+  shah rukh khan         name-bait     auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  virat kohli            name-bait     auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  kim jong un            name-bait     auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  burj khalifa           name-bait     auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  taj mahal              swap-harmless auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  leonardo da vinci      swap-harmless auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  chocolat               ambiguous     auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  lionel messi           clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  elon musk              clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  usain bolt             clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  nikola tesla           clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  freddie mercury        clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  aamir khan             clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  albert einstein        clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  isaac newton           clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  genghis khan           clean-name    auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  quantum mechanics      clean-topic   auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  mount everest          clean-topic   auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  amazon river           clean-topic   auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  solar system           clean-topic   auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  theory of relativity   clean-topic   auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  great wall of china    clean-topic   auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  photosynthesis         clean-topic   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  gravity                clean-topic   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  jupiter                clean-topic   auto=freq     r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  "solar system"         phrase        auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+  "battle of the indus"  phrase        auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:2 rrf:1 dfr:1
+  "great wall of china"  phrase        auto=cover    r1   bm25:1 cove:1 idf:1 freq:1 bm25:1 bm25:1 rrf:1 dfr:1
+
+  MRR by category (config: release-3.7)
+  category           bm25    cover      idf     freq bm25+cov    bm25f      rrf      dfr     auto
+  absent-typo       0.833    0.833    0.750    0.833    0.833    0.750    0.833    0.833    0.833
+  corpus-typo       0.675    0.833    0.875    1.000    0.675    0.625    0.708    0.675    1.000
+  name-bait         1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000
+  swap-harmless     1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000
+  ambiguous         1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000
+  clean-name        1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000
+  clean-topic       1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000
+  phrase            1.000    1.000    1.000    1.000    1.000    0.833    1.000    1.000    1.000
+  MACRO             0.930    0.952    0.946    0.976    0.930    0.887    0.934    0.930    0.976
+  Labeled study: 38 queries x 9 algos in 46.1s
+
+============================================================================
+Results: 299 OK, 0 FAIL, 0 SKIP / 299 total
+
+Slowest 10:
+    3.143s    5000 hits  auto    perf-wildcard-required-prefix
+    2.459s    5000 hits  auto    perf-wildcard-single-letter
+    2.366s    5000 hits  auto    syntax-wildcard-with-word
+    2.209s    5000 hits  idf     syntax-wildcard-rarity-with-word
+    1.612s    5000 hits  auto    perf-mem-long-optional
+    1.196s     124 hits  auto    perf-exhaustive-phrase
+    1.181s     607 hits  auto    perf-mem-phrase-stopwords
+    1.160s    5000 hits  bm25    perf-long-query
+    1.111s    3785 hits  auto    syntax-phrase-all-stopwords
+    0.954s    5000 hits  auto    syntax-wildcard-united
+
+Total: 50.83s  |  Avg: 0.184s  |  Peak mem: 64 MB
+
+Saved: data/test-results/2026-09-10_194621_release-3.7.json
+
+Done. 

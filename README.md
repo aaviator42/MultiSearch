@@ -2,7 +2,7 @@
 A highly modular and adaptable search engine, with support for multiple ranking algorithms and corpus types. It grew out of lessons learned running [iSearch](https://github.com/aaviator42/iSearch) in production.
  
 
-Current library version: `3.5` | `2026-08-25`
+Current library version: `3.7` | `2026-09-13`
 
 License: `AGPLv3`  
 
@@ -20,7 +20,7 @@ Here's some info about it:
  * It supports full query syntax: required (`+`) and excluded (`-`) words, adjacency-verified `"phrases"`, `wild*` prefixes, and `word^2.5` boosts, all combinable.
  * It expands queries in layers: typo-tolerant fuzzy matching, rule-based stemming, dictionary-verified stemming, morphological expansion, and WordNet synonyms and derivations. Every expansion is score-discounted, so a machine guess never outranks the words the user actually typed.
  * It scales well. The same code searches a ten-document test fixture and the 283,000-article Simple English Wikipedia index (48M postings, 1.1M unique terms, a 1.1 GB SQLite file).
- * It supports 9 scoring algorithms: auto, BM25, BM25+Coverage, BM25F, Reciprocal Rank Fusion, DFR, Coverage, Rarity and Frequency. Each is described in [Scoring algorithms](#scoring-algorithms).
+ * It supports 9 scoring algorithms: `auto`, BM25, BM25+Coverage, BM25F, Reciprocal Rank Fusion, DFR, Coverage, Rarity and Frequency. Each is described in [Scoring algorithms](#scoring-algorithms).
 
 ## Get started
 
@@ -71,6 +71,12 @@ MultiSearch consists of two files:
 These files can be found in the `lib/` folder in this repo. They must sit in the same directory, because the builder loads the searcher to share its tokenizer and position codec.
 
 A third file, `lib/OewnSynonyms.php`, is optional. It turns Open English WordNet into the synonym and derivation lists the searcher accepts. See [OewnSynonyms reference](#oewnsynonyms-reference).
+
+### How a search works
+
+One `search()` call runs seven stages: parse, expand, weigh, retrieve, prune and fetch, score, present. The diagram below traces the example query `einstien "solar systems" -moon` through every stage, with the numbers from a real run on the Wikipedia index. Click for full size, or open the [HTML version](docs/search-pipeline.html).
+
+[![The seven stages of the MultiSearch pipeline](docs/search-pipeline.png)](docs/search-pipeline.png)
 
 ## Basic Usage
 
@@ -281,7 +287,9 @@ Opens an index. Configuration errors throw an `InvalidArgumentException` with an
 | `title_field` | `null` | the field whose exact match earns the title bonus and acts as the tiebreaker. `null` means no field is special |
 | `heavy_fields` | `[]` | fields deferred to the second pass of two-phase retrieval |
 | `field_b` | `[]` | per-field BM25F length normalization, `['field' => b]`. Unlisted fields use the global `b` |
-| `max_wildcard_expansions` | `100` | cap per wildcard prefix, rarest terms first. `0` = no cap |
+| `max_wildcard_expansions` | `100` | completions per wildcard prefix per field, commonest first, skipping completions above `highfreq_cutoff`. `0` = no cap |
+| `wildcard_row_budget` | `200000` | stop adding completions once their summed document frequency passes this many posting rows per field. `0` = no budget |
+| `compound_numbers` | `phrase` | `3.14`, `10:30`, `192.168.0.1`, `2024-05-01` are searched as an adjacent phrase of their digit parts, which is how the tokenizer stores them. `words` = independent numbers |
 | `max_fuzzy_per_term` | `10` | fuzzy variants kept per query term. `0` = no cap |
 | `highfreq_cutoff` | `0.25` | drop optional terms present in more than this fraction of documents. `1.0` disables. Only active on corpora with 100+ documents |
 | `candidate_limit` | `5000` | how many candidates get scored. `0` = score every matching document |
@@ -315,20 +323,21 @@ Returns the array shown in [Basic Usage](#basic-usage). A query that matches not
 
 #### 3. Static helpers and constants
 
- * `Searcher::VERSION`: the engine version string (`'3.5'`), bumped whenever ranking can change. The demo app keys its result cache and search log on it.
+ * `Searcher::VERSION`: the engine version string (`'3.7'`), bumped whenever ranking can change. The demo app keys its result cache and search log on it.
  * `Searcher::ALGOS`: the accepted `algo` values.
  * `Searcher::tokenize(<text>, <fold>)`: the canonical tokenizer. Lowercases, optionally folds diacritics, strips apostrophes (`don't` → `dont`), and turns every other punctuation character into a space (`Coca-Cola` → `coca`, `cola`).
  * `Searcher::foldDiacritics(<text>)`: the folding step on its own (`São Paulo` → `Sao Paulo`, `Straße` → `Strasse`). Non-Latin scripts are untouched.
  * `Searcher::rootWords(<terms>)` and `Searcher::riskyRootCandidates(<word>)`: the stemming rules, exposed so you can inspect what a word stems to.
  * `Searcher::encodePositions()` / `Searcher::decodePositions()`: the delta-varint position codec the builder shares.
  * `$s->foldsDiacritics()`: whether this searcher folds query terms.
+ * `$s->settings()`: the effective configuration this instance searches with — profile, recall caps and every ranking knob after constructor overrides — for printing or logging. The test suite prints it at the top of every run so a saved result says what it was measured under.
 
 ## Query Syntax
 
 | Token | Meaning |
 |---|---|
 | `word` | Optional. Boosts the score if found |
-| `+word` | Required. Must appear in at least one searched field |
+| `+word` | Required. Must appear in at least one searched field. Never typo-corrected; with stemming on, `+wolves` is satisfied by `wolf` as well (the forms are an OR group) |
 | `-word` | Excluded. Must not appear in any searched field. With stemming on, `-wolves` also excludes `wolf` |
 | `"some phrase"` | On a positional index: the words must appear **adjacent, in order, in one field**. On a non-positional index: all the words are required, anywhere |
 | `+"phrase"` / `-"phrase"` | Required / excluded phrase, with the same positional split |
@@ -338,6 +347,8 @@ Returns the array shown in [Basic Usage](#basic-usage). A query that matches not
 Some notes:
 
  * Modifiers combine: `+creat*^1.5` is a required, boosted wildcard.
+ * A hyphenated prefix splits like any hyphenated word: `object-orient*` searches `object` plus the prefix `orient*`. (Joining the segments into `objectorient*` matched nothing, because the index tokenizes hyphens to spaces.)
+ * A compound number — a decimal, time, IP address or numeric date such as `3.14`, `10:30`, `192.168.0.1`, `2024-05-01` — is searched as a phrase of its digit parts, so `pi 3.14` finds the Pi article and not every page containing a 3 and a 14. Version strings and codes with letters (`v2.0`, `f-16`, `co2`) are ordinary words, and roman numerals stay as written, since titles say "World War II". Profile key `compound_numbers`.
  * Precedence is excluded > required > optional.
  * Every term is normalized through the tokenizer, so `don't` finds `dont`, and `coca-cola` searches `coca` + `cola` (adjacent, inside a phrase).
  * Required and excluded words are matched exactly. They are never typo-corrected, because fuzzy-excluding would hide documents the user never asked to hide.
@@ -355,7 +366,7 @@ Features:
  * `index.php`: the search page.
     * Controls for: algorithm, per-field weights, fuzzy confidence, stemming, stopword removal, WordNet synonyms and derivations (1 to 3 senses), two-phase retrieval, and an "exhaustive" toggle that sets `candidate_limit` to 0 for exact totals.
     * A description of each algorithm, the query syntax, and a set of example queries that each demonstrate one feature.
-    * An "Also searched" line under the results that shows every correction and expansion the engine applied, so there is no silent query rewriting.
+    * Two transparency lines under the results, so there is no silent query rewriting. "Also searched" lists every correction and expansion that widened the match set: variants of optional words, and stem variants of required words. "Also considered" lists variants that could only re-order results, never admit a document: morphological variants of required or quoted words, and any variant of a word inside a quoted phrase on a positional index.
     * A **result cache** (`data/result_cache.db`): the top 200 ranked hits are cached per query plus every result-affecting setting, index build and engine version, so page 2 onwards slices the cached set instead of re-running the search. Entries expire after 7 days and the newest 500 are kept. Turn it off by setting the `RESULT_CACHE` constant in `index.php` to `false`, for example when measuring real latency.
     * A **search log** (`data/search_log.db`): every query is logged with its settings, the resolved algorithm, timing, result count, the top results, the index build and engine version, whether it was a cache hit, and the client IP. Delete the file after a schema change and it is recreated; there is no migration by design.
  * `admin.php`: index statistics, table sizes, provenance from the index's `meta` table, sample articles, and the build instructions. Stats are cached in `data/admin-cache.json` and refreshed when the index or synonym database changes, because counting 48M rows is not a page-load-time query.
@@ -379,12 +390,12 @@ Tuning and adapting:
  * **Scores are relative.** The best hit is always 100; a 100 on a garbage query is still garbage. Equal scores tiebreak by title length in tokens when a `title_field` is set (shorter is treated as more canonical: "Water" before "Water pollution"), then by doc id, so ordering is deterministic.
  * **`total` is capped by `candidate_limit`** (default 5000). When more documents match, only the 5000 that contain the most of the user's original query words are scored and counted. Set `'candidate_limit' => 0` when an exact total matters more than latency.
  * **Positions are stored, but only phrases use them.** Positional indexes cost about 16% more space on the Wikipedia corpus. Quoted search phrases verify true adjacency; proximity *scoring* for unquoted multi-word queries still uses a cheaper density heuristic, so ranking and memory are untouched for every query without quotes.
- * **Fuzzy matching applies to the words the user typed, and nothing else.** Required and excluded terms, phrase words, and every machine-generated expansion (stems, synonyms, derivations, morphological variants) are matched exactly. This prevents chains like `monster` → `fiend` (synonym) → `friend` (fuzzy).
+ * **Fuzzy matching applies to the words the user typed, and nothing else.** Required and excluded terms, phrase words, and every machine-generated expansion (stems, synonyms, derivations, morphological variants) are matched exactly. This prevents chains like `monster` → `fiend` (synonym) → `friend` (fuzzy). Numbers, and any token containing a digit, are also exact: `19` is not a typo for `1`, `co2` is not a typo for `cod`, and a one-digit query used to expand to the ten commonest two-digit tokens in the corpus.
  * **Fuzzy candidates must share the query term's first character.** `einstien` → `einstein` is caught; `feinstein` → `einstein` is not. A second-character pass exists in the code but is disabled by default, because it cost about 70 ms per term when testing with the Wikipedia corpus.
  * **Developed with English in mind, but can easily be adapted for other languages.** The stemming rules and morphological suffixes are English, and the demo supplies an English stopword list and WordNet. Everything else (tokenization hooks, scoring, recall caps) is language-neutral. The `term_normalizer` hook is the extension point for other scripts, code identifiers, and so on.
  * **Configuration errors throw; empty results never do.** A wrong index path, a non-index file, an unknown algorithm, an unknown field name, or a typo'd ranking knob all throw `InvalidArgumentException` with a message that says what to fix. A query that matches nothing returns an empty result.
  * **`'diagnostics' => true` opens the engine's reasoning.** The result gains a `diag` key with the parsed query, every expansion with its origin, class and boost, wildcard expansion counts, typo swaps, dropped terms, the candidate funnel, positional phrase checks, and `auto`'s routing evidence. The shape isn't a contract and may change between versions. The default result is byte-identical without it.
- * **Broad queries cost memory.** Posting rows for matched terms are loaded into PHP arrays. The recall caps exist to bound this. The full test suite, which includes deliberately broad queries, peaks at about 360 MB against the Wikipedia corpus.
+ * **Memory is proportional to matched documents, not posting rows.** The first pass streams postings into one coverage bitmask per document (about 40 bytes each) and only the pruned survivors have their posting rows materialized. Required and phrase words are resolved by rarest-first intersection, so `"the united states of america"` looks up `the` for the 13K `america` documents instead of loading all 270K of its rows. Excluded words are only fetched for the survivors. On the Wikipedia corpus every query shape tested stays under 65 MB, most under 25 MB. The earlier design kept a row per posting in PHP arrays, about 450 bytes each, which put stopword phrases and exclusions at 300 MB and ordinary three-word queries near 100 MB; the test suite now carries memory budgets so it stays fixed.
  * **The searcher never writes to the index.** It opens the file with `SQLITE_OPEN_READONLY`. The incremental builder uses WAL mode with a busy timeout, so a searcher and a builder can work on the same file at the same time. `bulkBuild()` takes an exclusive lock instead, since its output isn't readable until it finishes anyway.
  * **Every `IN()` list is batched at 900 variables**, so SQLite's classic 999-variable limit never bites. `WITHOUT ROWID` tables need SQLite 3.8.2 or newer (2013).
 
@@ -392,7 +403,7 @@ Tuning and adapting:
 
 Pass one of these as `'algo'`. All of them are implemented in `scoreDoc()` and `search()` in `lib/MultiSearch.php`, with their formulas commented; the paper-derived ones cite their sources there too.
 
-1. **`auto`**: Automatically selects the best scoring algorithm based on properties of the search query. Wildcard queries and queries with typo evidence use `freq`, question-shaped queries (how/what/who...) use `bm25f`, everything else uses `cover`. The routing was chosen by a labeled relevance study on the Simple English Wikipedia corpus. You should carry out tests on your own corpus with typical queries and adjust the routing in the code if needed.
+1. **`auto`**: Automatically selects the best scoring algorithm based on properties of the search query. Wildcard queries, queries with typo evidence, single-word queries and question-shaped queries (how/what/who...) use `freq`; everything else uses `cover`. The table is five ranking knobs (`auto_wildcard_algo`, `auto_typo_algo`, `auto_question_algo`, `auto_single_word_algo`, `auto_default_algo`), chosen by labeled relevance studies on the Simple English Wikipedia corpus. You should carry out tests on your own corpus with typical queries and retune them; the study harness that produced the defaults is described under [Testing](#testing).
 
 2. **`bm25`** (BM25): Computes scores for documents by combining word frequency (with diminishing returns, called TF saturation: the 20th occurrence matters much less than the 2nd), word rarity (IDF), and document length normalization so longer articles don't dominate. Popular for full-text search. The implementation is BM25+ (Lv & Zhai 2011), which adds a small lower bound (`delta`) so very long documents aren't starved to zero.
 
@@ -414,14 +425,16 @@ Pass one of these as `'algo'`. All of them are implemented in `scoreDoc()` and `
    A document containing 3 of 4 terms in the search query scores 75%, regardless of how many times they each appear.  
    Best for when you want "match as many of these terms as possible" without caring about frequency or relevance depth.
 
-8. **`idf`** (Rarity): rarity only: rare words from the search query count more than common ones when computing scores, and rare terms dominate the ranking. When searching for "quantum mechanics", "quantum" contributes more to documents' scores than "mechanics" because it appears in fewer documents.  
-   Like `freq`, but distinctive terms are amplified and generic terms are suppressed.
+8. **`idf`** (Rarity): each matched word counts once, weighted by its IDF; how often it repeats within a document doesn't matter. In "quantum mechanics", `quantum` outweighs `mechanics` because fewer articles contain it. A wildcard prefix is one concept: a document is credited with the rarest completion it contains, once, rather than with the sum over every completion it happens to use. That is what makes Rarity the tool for exploring the uncommon end of a word family — `neuro*` gives Neuroethology and Neuropeptide where Coverage gives Neuron and Neurology — instead of rewarding pages that merely use many common completions (the summed version put "Uncertainty principle" first for `un*` on the strength of twelve ordinary un- words). Every other algorithm keeps per-completion scoring, because for them accumulation is the point.  
+   Rarity has no preference for documents matching *all* the words, and a single typed word gives every match the same score, so it is a poor choice for navigational queries; `auto` never picks it.
 
 9. **`freq`** (Frequency): each document's score = how often words from the search query appear in it, with diminishing returns: the sum of log(1 + tf) over the matched terms, so 20 occurrences count about 3x as much as two, not 10x. Set the `freq_tf_log` knob to `false` for raw counts, where long documents win outright. There is no length normalization, so longer documents still have an edge. Every matching spelling variant of a word adds up, which is why `auto` picks it for wildcards and typos. Useful when repetition signals topical focus.
 
 Some notes on `auto`:
 
  * Low `confidence` alone is not typo evidence. A query counts as typo'd only when fuzzy expansion actually promoted a correction, or when a typed word is absent from the index entirely. The `auto_typo_fraction` knob sets how many of the typed words must be suspect; by default one is enough.
+ * The rules apply in order. A wildcard routes to `auto_wildcard_algo` before anything else is looked at. Then, with fuzzy on, typo evidence routes to `auto_typo_algo` even for a question-shaped query. Then a question word picks `auto_question_algo`, a single typed word picks `auto_single_word_algo`, and `auto_default_algo` covers the rest.
+ * Single words go to `freq` because `cover` has nothing to rank them by: every document containing the word scores the same, and the title tiebreak then favours the shortest title, so `beethoven` returned the film and `mozart` returned Leopold. Questions go to `freq` because it beat `bm25f` on a labeled set (0.925 vs 0.847 MRR with stopwords on) and `bm25f` was the slow path (1.4 s median against 0.3 s). The known cost is surname collisions: `gandhi` now ranks Rahul Gandhi above the Mahatma.
  * The question words are `how`, `what`, `which`, `who`, `whom`, `whose`, `when`, `where`, `why`. Detection runs before stopword removal, so they still count if you filter stopwords.
  * The first routing table (single word → `dfr`, multi-word → `bm25f`, fuzzy → `rrf`, wildcard → `bm25`) was intuition, and ranked 6th of 9 in the labeled study. The current one was picked by measurement.
 
@@ -435,7 +448,7 @@ Coverage is **concept-based** by default: each word the user typed is one slot, 
 
 ## Query expansion
 
-All expansion is discounted by trust. Stems ride at 0.8× the typed word's boost, dictionary-verified risky stems and derivations at 0.7×, morphological variants at a flat 0.7, fuzzy variants at 0.5 per edit of distance. Derived forms add recall; they never outrank exact matches. Fuzzy, synonym and derivation expansion apply to optional terms only. Stemming also applies to required and excluded terms.
+All expansion is discounted by trust. Stems ride at 0.8× the typed word's boost, dictionary-verified risky stems and derivations at 0.7×, morphological variants at a flat 0.7, fuzzy variants at 0.5 per edit of distance. Derived forms add recall; they never outrank exact matches. Fuzzy, synonym and derivation expansion apply to optional terms only. Stemming also applies to required and excluded terms: a required word's stem group is an OR (`+systems` also admits documents that only say `system`), while its morphological variants are scored but never admit a document on their own. Inside a quoted phrase on a positional index, no variant widens the match at all, because adjacency is checked on the literal words; stems only add a little score.
 
  * **Fuzzy** (`confidence` below 100): Damerau-Levenshtein distance against the index's unique-term table.
     * The maximum edit distance scales with term length and confidence: `max(1, floor(length × (100 − confidence) / 100))`. At confidence 85, a 7-letter word allows 1 edit; a 14-letter word allows 2.
@@ -455,21 +468,23 @@ All expansion is discounted by trust. Stems ride at 0.8× the typed word's boost
     * Porter stemming was tried and rejected: it over-stems (`universe` → `univers`) and loses exact matches.
  * **Verified risky stemming**: some rules often produce real but unrelated words (`summer` → `sum`, `corner` → `corn`). The rules for `-er`/`-est`, `-ly`/`-ily`, `-ous` and `-ity`/`-lity` are generated but only *used* when a dictionary callback (`stem_verifier`) confirms the two words are related. `quickly` → `quick` passes; `summer` → `sum` is rejected. `OewnSynonyms::derivationVerifier()` provides this callback from WordNet's derivation links. Without a verifier, these rules stay off.
  * **Synonyms and derivations**: plain data, `[['planet', 'world', 'globe'], ...]`. The engine is deliberately not coupled to any lexical database. `OewnSynonyms` builds these groups from Open English WordNet, with sense ordering (1 sense = primary sense only, 3 = broad). Derivations reach what suffix rules can't: `decision` also searches `decide`.
- * **Wildcards**: a primary-key range scan over the unique-term table, capped per field at the `max_wildcard_expansions` *rarest* completions (default 100), because rare terms are the most discriminative and have the highest IDF. Without the cap, `th*` expanded to 7,076 body terms and took 78 seconds.
- * **Stopwords**: off by default, because BM25's IDF already suppresses common words and the high-frequency cutoff drops the extreme cases. The engine ships no list; the demo app ships `config/stopwords.json` (118 English words). Only optional terms are ever filtered, so `+the +who` still finds the band.
+ * **Wildcards**: a primary-key range scan over the unique-term table. Per field, completions above `highfreq_cutoff` are skipped and the rest are taken *commonest first*, up to `max_wildcard_expansions` (default 100) or until their summed document frequency passes `wildcard_row_budget` posting rows (default 200,000), whichever comes first. Commonest first because that is what the user meant: `comp*` should reach company, computer and complete before compaan. The first design took the *rarest* completions, on the argument that rare terms are the most discriminative, and `comp*` never matched computer at all; that confused how a completion should be weighted with whether it should be included. A 24-query study found 19 of 47 intended completions under the rarest-first rule and 46 under this one. Rarer included completions still score higher, since IDF is applied at scoring time. Each prefix counts as one concept for coverage, so a pure wildcard query prunes to `candidate_limit` like any other, with documents carrying the prefix in their title surviving the cut first. Rarity also scores a prefix as one concept (its rarest matched completion); the other algorithms score every completion, which for Frequency is the point. Without the cap, `th*` once expanded to 7,076 body terms and took 78 seconds; the row budget keeps single-letter prefixes near two seconds.
+ * **Stopwords**: the engine applies a list only when one is passed. The demo ticks "remove stopwords" by default: the earlier reasoning, that BM25's IDF suppresses common words anyway, holds for BM25 and Rarity but not for Coverage and Frequency, which `auto` routes to most, and a labeled study measured question queries at 0.60 MRR without the list and 0.93 with it ("who was the first woman in space" went from A Wrinkle in Time to Tereshkova). The demo also uses the list to keep function words out of the WordNet lookup (`in` → indium, `at` → astatine were real expansions). The engine ships no list; the demo app ships `config/stopwords.json` (118 English words). Only optional terms are ever filtered, so `+the +who` still finds the band.
 
 ## Recall vs latency
 
-Four mechanisms deliberately trade recall for speed. All are runtime config (constructor or per search), and all can be disabled:
+Six mechanisms deliberately trade recall for speed. All are runtime config (constructor or per search), and all can be disabled:
 
 | Knob | Default | What it hides when active | Disable with |
 |---|---|---|---|
-| `max_wildcard_expansions` | 100 | documents matching only the *common* completions of a broad wildcard | `0` |
+| `max_wildcard_expansions` | 100 | documents matching only the *rarer* completions of a broad wildcard (beyond the 100 commonest per field) | `0` |
+| `wildcard_row_budget` | 200000 | further completions of a single-letter prefix once the commonest ones already sum to 200K posting rows per field | `0` |
 | `max_fuzzy_per_term` | 10 | documents matching only distant fuzzy variants | `0` |
 | `highfreq_cutoff` | 0.25 | optional terms present in more than 25% of documents (near-zero IDF anyway; only active at 100+ documents) | `1.0` |
 | `candidate_limit` | 5000 | documents beyond the 5000 best-coverage candidates; also caps `total` | `0` |
+| `broad_cap` | 20000 | when *every* required or phrase word is above `highfreq_cutoff` (`"of the"`, `+the`), documents matching only those words beyond a 20K-row-per-field sample; docs that also match an optional word are always verified in full. `diag.candidates.truncated` reports it | `0` |
 
-There is also **two-phase retrieval** (`'two_phase' => true`): score the light fields first, and fetch `heavy_fields` postings only for the top `phase1_limit` survivors (default 1000). Roughly 2× faster on the Wikipedia corpus, but a document that matches *only* in a heavy field is invisible to it, which is why it is opt-in. With no `heavy_fields` declared it silently falls back to standard retrieval.
+There is also **two-phase retrieval** (`'two_phase' => true`): collect candidates from the light fields only, and fetch postings for the top `phase1_limit` survivors (default 1000). Faster on broad queries, but a document whose *optional* words appear only in a heavy field is invisible to it, which is why it is opt-in. Required and phrase words are still resolved across all fields in this mode, and the memory advantage over standard retrieval is small because standard retrieval also materializes survivors only. With no `heavy_fields` declared it silently falls back to standard retrieval.
 
 These defaults exist because the failure modes are real: on the Wikipedia corpus, uncapped broad wildcards took tens of seconds, and unfiltered common words ran a memory-constrained PHP process out of memory. Small corpora can safely disable all of these.
 
@@ -508,7 +523,12 @@ The full set (23 knobs):
 | `swap_zero_df_promote` | 100 | a typed word with no matches promotes its best variant if that variant is in at least this many documents |
 | `noise_exempt_promoted` | true | a promoted correction is exempt from the noise filter |
 | `title_promoted_as_form` | true | a promoted correction counts for the title bonus |
-| `auto_typo_fraction` | 0.0 | fraction of typed words that must be suspect before `auto` routes to `freq`. 0 = one is enough |
+| `auto_typo_fraction` | 0.0 | fraction of typed words that must be suspect before `auto` routes to `auto_typo_algo`. 0 = one is enough |
+| `auto_wildcard_algo` | `freq` | `auto`'s pick for queries with a `word*` prefix |
+| `auto_typo_algo` | `freq` | `auto`'s pick when fuzzy expansion found typo evidence |
+| `auto_question_algo` | `freq` | `auto`'s pick for question-shaped queries |
+| `auto_single_word_algo` | `freq` | `auto`'s pick for one typed word |
+| `auto_default_algo` | `cover` | `auto`'s pick for everything else. Any of the five accepts any algorithm except `auto` |
 | `freq_tf_log` | true | `freq` uses log(1 + tf) instead of raw counts |
 | `concept_coverage` | true | coverage counts typed words, not expanded terms |
 | `stem_boost` | 0.8 | discount for stem variants |
@@ -564,7 +584,7 @@ It improves English searches in three ways:
 require 'lib/OewnSynonyms.php';
 
 $oewn = new \MultiSearch\OewnSynonyms('data/oewn.db');
-$words = \MultiSearch\OewnSynonyms::queryWords($query);
+$words = \MultiSearch\OewnSynonyms::queryWords($query, $stopwords);   // skip function words and 1-2 letter tokens
 
 $result = $s->search($query, [
     'synonyms'    => $oewn->groupsFor($words, 1),
@@ -584,7 +604,7 @@ The repo ships the database (`data/oewn.db`) and the zip it was built from. `php
  * `groupsFor(<words>, <max senses>)`: synonym groups, most common senses first. `1` = primary sense only (precise), `3` = broad. Words with no synonyms produce no group.
  * `derivationsFor(<words>)`: derivationally related words in the same group shape.
  * `derivationVerifier()`: the `stem_verifier` callable, with cached lookups. Returns `null` when `ready()` is false, and then the searcher simply keeps the risky rules off. A database without the derivations table is treated as a broken build and throws on first use: rebuild it.
- * `queryWords(<query>)` (static): strips the query syntax (`+ - " * ^N`) and bare numbers, so only dictionary-shaped words reach WordNet.
+ * `queryWords(<query>, <skip words>, <min length>)` (static): strips the query syntax (`+ - " * ^N`), bare numbers, the words in `<skip words>` (pass your stopword list) and tokens shorter than `<min length>` (default 3), so only dictionary-shaped words reach WordNet.
 
 What the build imports: synsets with sense order, and derivational and pertainym links, stored in both directions. What it deliberately skips:
 
@@ -623,7 +643,7 @@ php scripts/algo-compare.php 'query'  # exploration, not assertion: every algori
 
 Some notes:
 
- * The main suite (251 checks) runs against the real Wikipedia index, not fixtures, and asserts on actual rankings: that `albert einstein` and `bob einstein` each put their own article first, that `+"world war" -"cold war"` returns results, that `football -americ*` still finds thousands of documents, and that phrase hit counts stay within ±3% bands of counts validated against the dump.
+ * The main suite (285 checks) runs against the real Wikipedia index, not fixtures, and asserts on actual rankings: that `albert einstein` and `bob einstein` each put their own article first, that `+"world war" -"cold war"` returns results, that `football -americ*` still finds thousands of documents, and that phrase hit counts stay within ±3% bands of counts validated against the dump.
  * The labeled study covers eight query categories: clean names, clean topics, phrases, corpus typos, absent typos, name bait, ambiguous, and swap-harmless. On the current build, `auto` and `freq` score a macro-MRR of .976, the other algorithms between .887 and .952.
  * The `--save`/`--compare` cycle exists because ranking changes have non-local effects. Snapshots catch regressions that spot checks miss.
  * `test-api.php` and `test-positional.php` build tiny throwaway indexes and don't need the Wikipedia data.
@@ -646,14 +666,14 @@ Everything in `scripts/` is part of the Wikipedia demo and the test tooling, not
 
 **Testing and comparison**
 
- * `test-suite.php`: the main regression suite, run against the real Wikipedia index (251 checks). Tokenizer, ranking, fuzzy matching, routing, query syntax, stemming, performance budgets, positional phrases, diacritic folding, and the 38-query labeled ranking study that scores every algorithm by MRR per query category.
+ * `test-suite.php`: the main regression suite, run against the real Wikipedia index (285 checks). Every run starts by printing the runtime it is measuring under: engine and PHP versions, memory limit, index provenance, corpus profile, WordNet availability, every recall cap and ranking knob, and the per-test and labeled-study defaults. Tokenizer, ranking, fuzzy matching, routing, query syntax (operators, phrases, wildcards, exact numbers), stemming, performance budgets for time and memory, positional phrases, diacritic folding, and the 38-query labeled ranking study that scores every algorithm by MRR per query category. Tests are declarative: `expect_min`/`expect_max`/`expect_top`/`expect_in_top` on results, `max_time` and `max_mem_mb` budgets, `expect_diag` for dot-path assertions on the diagnostics channel, and `opts` to pass any engine option.
     * `--fast` skips the performance and comparison groups.
     * `--labeled-only` runs just the ranking study.
     * `--save` writes a timestamped JSON snapshot to `data/test-results/`; `--compare` diffs the last two snapshots, `--compare N` the last N.
     * `--rk='{"k1":1.2}'` runs the whole suite under ranking-knob overrides, and `--label=name` names the saved run, so a proposed tuning is gated by the assertions and scored by the study.
     * `--db=path` runs against another index build, for example to A/B a rebuild.
- * `test-api.php`: the API contract (30 checks): configuration errors throw with useful messages, valid queries never throw, the diagnostics channel, and `Builder::bulkBuild()` checked against the incremental build. Uses tiny throwaway indexes, so it runs in seconds and doesn't need the Wikipedia data.
- * `test-positional.php`: positional phrase semantics (22 checks): the position codec, adjacency verification, and the word-level fallback on a non-positional index. Fixture-based, like `test-api.php`.
+ * `test-api.php`: the API contract (42 checks): configuration errors throw with useful messages, valid queries never throw, the diagnostics channel, `Builder::bulkBuild()` checked against the incremental build, and on a 130-document fixture the parser and retrieval contracts: zero-prefixed words, exact numbers, survivors-only exclusion, the `truncated` flag, commonest-first wildcards and the row budget. Uses tiny throwaway indexes, so it runs in seconds and doesn't need the Wikipedia data.
+ * `test-positional.php`: positional phrase semantics (33 checks): the position codec, adjacency verification, and the word-level fallback on a non-positional index. Fixture-based, like `test-api.php`.
  * `algo-compare.php`: exploration, not assertion. Runs one or more queries through every algorithm and prints a grid, one row per algorithm, with the consensus top result and every disagreement marked. Useful for deciding what the right answer to a query *is* before recording it in the labeled study.
     * `php scripts/algo-compare.php 'beyonce' 'kim jong un'` runs your queries at confidence 85; with no arguments it runs a built-in set.
     * `--conf=100` sets the fuzzy confidence.
@@ -673,4 +693,4 @@ Data downloaded by the scripts: [Simple English Wikipedia](https://simple.wikipe
 
 -----
 
-Documentation updated: `2026-09-04`
+Documentation updated: `2026-09-13`

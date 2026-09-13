@@ -56,8 +56,13 @@ then scaled to Simple English Wikipedia (~200K articles, 1.2M unique terms,
                 [] = two_phase falls back to standard.  default: []
   field_b       per-field BM25F length-normalization b, ['field' => b].
                 Unlisted fields use the global b.       default: []
-  max_wildcard_expansions  cap per wildcard prefix, rarest-first. 0 = no cap.
-                                                       default: 100
+  max_wildcard_expansions  completions per wildcard prefix per field, taken
+                   COMMONEST first (what the user most likely meant), skipping
+                   completions above highfreq_cutoff. 0 = no cap.  default: 100
+  wildcard_row_budget  stop adding completions once their summed document
+                   frequency passes this many posting rows per field — bounds
+                   the time a single-letter prefix can cost. 0 = no budget.
+                                                       default: 200000
   max_fuzzy_per_term       fuzzy variants kept per query term. 0 = no cap.
                                                        default: 10
   highfreq_cutoff  drop optional terms present in more than this fraction of
@@ -68,6 +73,15 @@ then scaled to Simple English Wikipedia (~200K articles, 1.2M unique terms,
                    bool only for indexes with no meta row.  default: auto
   candidate_limit  max candidates scored (WAND-style coverage prune).
                    0 = score every matching doc.       default: 5000
+  compound_numbers 'phrase' (default) = a token like 3.14, 10:30, 192.168.0.1
+                   or 2024-05-01 is searched as an adjacent phrase of its
+                   digit parts, since the tokenizer stores it that way;
+                   'words' = the parts are independent words.
+  broad_cap        rows per field streamed for a required/phrase group when
+                   EVERY required word is above highfreq_cutoff (no rare
+                   word to anchor on — "of the"). The result is then a
+                   sample and diag.candidates.truncated is true. 0 = no cap.
+                                                       default: 20000
   phase1_limit     two-phase survivor count.            default: 1000
   stem_verifier    callable(word, root): bool — dictionary check that
                    unlocks the RISKY stem rules (-er/-ly/-ous/-ity); see
@@ -358,6 +372,36 @@ class Searcher
         // 0 = any evidence routes (historical); 0.5 = majority; 1.0 = all.
         'auto_typo_fraction'  => 0.0,
 
+        // auto routing table — the algorithm each query shape resolves to,
+        // checked in this order: wildcard, typo evidence (fuzzy on), question
+        // word, single typed word, everything else. Data, not code, so a
+        // corpus owner can retune it from a labelled study without editing
+        // the engine (README: "Some notes on auto").
+        //
+        // History. The first table (single word -> dfr, multi-word -> bm25f,
+        // fuzzy -> rrf, wildcard -> bm25) was intuition and ranked 6th of 9 in
+        // the original 38-query study; the second (wildcard/typo -> freq,
+        // question -> bm25f, else cover) won it at macro-MRR .976. A 2026-09
+        // study on 89 hand-labelled + 126 agent-derived queries (tmp/autotune)
+        // found two systematic gaps in that table: single typed words, where
+        // cover has no signal (every match ties, the title tiebreak picks the
+        // shortest title: "beethoven" -> the film, "mozart" -> Leopold) and
+        // freq wins .79 vs .66; and question-shaped queries, where freq beat
+        // bm25f .925 vs .847 with stopwords on and .70 vs .60 without, and
+        // bm25f was the slow path (1.4 s median vs 0.3 s). Routing both to
+        // freq lifted the hand set from .757 to .790 MRR (66% -> 74% top-1).
+        // Known costs, kept: "gandhi" now ranks Rahul Gandhi above the
+        // Mahatma (his article uses the surname more), and one long question
+        // about jazz in America went to a long US-history article — freq
+        // rewards repetition and long documents. All-freq scored best of any
+        // single algorithm (.751 macro) but loses operator queries to cover
+        // (.80 vs .71), so cover stays the multi-word default.
+        'auto_wildcard_algo'    => 'freq',
+        'auto_typo_algo'        => 'freq',
+        'auto_question_algo'    => 'freq',
+        'auto_single_word_algo' => 'freq',
+        'auto_default_algo'     => 'cover',
+
         // freq_tf_log — freq scores log(1+tf) per term instead of raw tf,
         // damping the long-document blowout (a body mentioning "khan" 50
         // times scores ~4, not 50) while keeping freq's strength: rewarding
@@ -428,14 +472,33 @@ class Searcher
     // tried to bind thousands of doc_ids in a single IN() clause.
     private const BATCH_SIZE = 900;
 
-    // Wildcard max expansions: cap how many terms a single prefix wildcard can expand to.
-    // Without this, "th*" expands to 7,076 body terms → 991K postings → 78s.
-    // With cap at 100 (sorted by doc_freq ascending = rarest first), we get the most
-    // discriminative terms while keeping expansion fast.
-    // Elasticsearch defaults to 50 for prefix queries. We use 100 for better recall.
-    // Tried: no cap — broad wildcards like "th*" took 78s. 200 still slow (~15s).
-    // 100 gives good balance: fast + good ranking (rare terms have highest IDF).
+    // Wildcard expansion caps. A prefix expands to at most MAX_WILDCARD_EXPANSIONS
+    // completions per field, COMMONEST first and below highfreq_cutoff, and the
+    // list also stops once the completions' summed document frequency passes
+    // WILDCARD_ROW_BUDGET posting rows (the first pass streams one row per
+    // posting, so that sum IS the time cost).
+    //
+    // History: the cap was rarest-first through 3.6, justified by IDF ("rare
+    // terms are the most discriminative"). That confused how a completion
+    // should be WEIGHTED with whether it should be INCLUDED: for any productive
+    // prefix the 100 rarest completions are typos and obscure names, so comp*
+    // matched compaan and companeez but never computer or company, and un*
+    // returned "David Unaipon" instead of "United States". A 24-query study
+    // (2026-09-09) found 19 of 47 intended completions under rarest-first and
+    // 46 under this rule, at ~0.3 s more per pure prefix. The IDF argument
+    // still holds where it belongs: rarer included completions score higher.
+    // Uncapped, "th*" once took 78 s; the budget is what keeps single-letter
+    // prefixes near 2 s now that memory no longer depends on posting rows (see
+    // the candidate retrieval block). Elasticsearch defaults to 50 completions.
     private const MAX_WILDCARD_EXPANSIONS = 100;
+    private const WILDCARD_ROW_BUDGET     = 200000;
+    // Rows per field streamed for a required word when no required word is
+    // rare enough to anchor the intersection (see the candidate retrieval
+    // block in search()). 20K rows ≈ 1 MB of coverage masks.
+    private const BROAD_CAP = 20000;
+    // Relative cost of one (term, doc) PK probe vs one scanned posting row —
+    // the seek-or-scan chooser in streamMasks()/fetchPostingsForDocs().
+    private const SEEK_COST_ROWS = 6;
 
     // Fuzzy expansion per-term limit: max fuzzy variants per original query term.
     // Without this, "history" at confidence 85 generates 16 fuzzy variants like
@@ -505,6 +568,12 @@ class Searcher
     // Contract: stopwords are filtered from OPTIONAL terms only — +required
     // and phrase words are never stopword-filtered ("+the +who" still finds
     // the band).
+    // How that stays affordable: required words are resolved by rarest-first
+    // intersection, so a common word's postings are only ever looked up for
+    // the docs that already contain the rarer words ("the" for the ~13K
+    // "america" docs, not for all 270K). Only when EVERY required word is
+    // common does the engine fall back to a capped sample (broad_cap). See
+    // the candidate retrieval block in search().
 
     // Pre-computed IDF values loaded by fetchTermStats(), keyed by [$field][$term].
     // Eliminates log() calls in scoreDoc — IDF only depends on N and df, both fixed
@@ -548,7 +617,7 @@ class Searcher
     // search log and result cache record it so before/after comparisons
     // across engine changes stay attributable. Bump whenever ranking can
     // change.
-    public const VERSION = '3.5';
+    public const VERSION = '3.7';
 
     // Sentinel for deferred auto-algorithm resolution — conf<100 queries
     // can't be classified as "typo'd" until fuzzy expansion has run (see the
@@ -579,6 +648,11 @@ class Searcher
     private array   $fieldB = [];
     private int     $maxWildcardExpansions = self::MAX_WILDCARD_EXPANSIONS;
     private int     $maxFuzzyPerTerm = self::MAX_FUZZY_PER_TERM;
+    private int     $broadCap        = self::BROAD_CAP;
+    private int     $wildcardRowBudget = self::WILDCARD_ROW_BUDGET;
+    private string  $compoundNumbers   = 'phrase';   // see the compound-number rule in parseQuery()
+    private array   $fieldTotalDocsCache = [];   // field => total_docs (index-static)
+    private array   $groupRowsMemo   = [];   // per-search: required group => summed df (see search())
     private float   $highfreqCutoff = 0.25;
     private int     $candidateLimit = 5000;
     private int     $phase1Limit = 1000;
@@ -609,6 +683,9 @@ class Searcher
         $this->fieldB                = $config['field_b'] ?? [];
         $this->maxWildcardExpansions = (int)($config['max_wildcard_expansions'] ?? self::MAX_WILDCARD_EXPANSIONS);
         $this->maxFuzzyPerTerm       = (int)($config['max_fuzzy_per_term'] ?? self::MAX_FUZZY_PER_TERM);
+        $this->broadCap              = (int)($config['broad_cap'] ?? self::BROAD_CAP);
+        $this->wildcardRowBudget     = (int)($config['wildcard_row_budget'] ?? self::WILDCARD_ROW_BUDGET);
+        $this->compoundNumbers       = ($config['compound_numbers'] ?? 'phrase') === 'words' ? 'words' : 'phrase';
         $this->highfreqCutoff        = (float)($config['highfreq_cutoff'] ?? 0.25);
         $this->candidateLimit        = (int)($config['candidate_limit'] ?? 5000);
         $this->phase1Limit           = (int)($config['phase1_limit'] ?? 1000);
@@ -711,6 +788,44 @@ class Searcher
     }
 
     /** Whether query terms are diacritic-folded (index-driven, see ctor). */
+    /**
+     * The effective configuration this instance searches with: corpus
+     * profile, recall caps and every ranking knob after constructor
+     * overrides. Read-only, for printing and logging — the test suite prints
+     * it at the top of every run so a saved result file says what it was
+     * measured under, and an app can show it on an admin page.
+     *
+     * Why a method and not public properties: the knobs live in private
+     * fields with defaults spread over constants and RANKING_DEFAULTS, and
+     * the two earlier ways of "knowing what the suite ran with" both failed —
+     * the suite header printed only the index path, and a saved run stored
+     * only the --rk overrides, so a result measured under a changed default
+     * looked identical to one measured under the old. Per-search option
+     * overrides are not included here; they are per call by definition.
+     */
+    public function settings(): array
+    {
+        return [
+            'version'                 => self::VERSION,
+            'fields'                  => array_keys($this->getDefaultFields()),
+            'title_field'             => $this->titleField,
+            'heavy_fields'            => $this->heavyFields,
+            'field_b'                 => $this->fieldB,
+            'fold_diacritics'         => $this->foldDiacritics,
+            'stem_verifier'           => $this->stemVerifier !== null,
+            'term_normalizer'         => $this->termNormalizer !== null,
+            'candidate_limit'         => $this->candidateLimit,
+            'phase1_limit'            => $this->phase1Limit,
+            'highfreq_cutoff'         => $this->highfreqCutoff,
+            'max_fuzzy_per_term'      => $this->maxFuzzyPerTerm,
+            'max_wildcard_expansions' => $this->maxWildcardExpansions,
+            'wildcard_row_budget'     => $this->wildcardRowBudget,
+            'broad_cap'               => $this->broadCap,
+            'compound_numbers'        => $this->compoundNumbers,
+            'ranking'                 => $this->ranking,
+        ];
+    }
+
     public function foldsDiacritics(): bool
     {
         return $this->foldDiacritics;
@@ -730,6 +845,15 @@ class Searcher
                 'Unknown ranking keys: ' . implode(', ', array_keys($bad))
                 . ' (valid: ' . implode(', ', array_keys(self::RANKING_DEFAULTS)) . ')'
             );
+        }
+        // Routing knobs must name a concrete algorithm — 'auto' would recurse.
+        foreach ($ranking as $k => $v) {
+            if (str_starts_with($k, 'auto_') && str_ends_with($k, '_algo')
+                && (!in_array($v, self::ALGOS, true) || $v === 'auto')) {
+                throw new \InvalidArgumentException(
+                    "Ranking knob $k must be one of " . implode(', ', array_diff(self::ALGOS, ['auto'])) . ", got '$v'"
+                );
+            }
         }
     }
 
@@ -1026,7 +1150,14 @@ class Searcher
                 $result[] = mb_substr($word, 0, -2);          // national → nation
             }
         }
-        return array_values(array_unique(array_filter($result, fn($w) => strlen($w) > 1)));
+        // Drop one-character GENERATED variants only. The original words always
+        // survive: this filter used to apply to them too, so a one-character
+        // typed word ("3", "a", "x") came back as an empty stem group, and with
+        // stemming on a REQUIRED one made every document fail passesRequired()
+        // — "pi 3.14" returned nothing once 3.14 became the phrase [3, 14]
+        // (2026-09-10). rootWords() contract: the input is always in the output.
+        return array_values(array_unique(array_filter($result,
+            fn($w) => strlen($w) > 1 || in_array($w, $terms, true))));
     }
 
     /**
@@ -1214,6 +1345,9 @@ class Searcher
         $fieldBMap   = $options['field_b'] ?? $this->fieldB;
         $maxWild     = (int)($options['max_wildcard_expansions'] ?? $this->maxWildcardExpansions);
         $maxFuzzy    = (int)($options['max_fuzzy_per_term'] ?? $this->maxFuzzyPerTerm);
+        $broadCap    = (int)($options['broad_cap'] ?? $this->broadCap);
+        $wildBudget  = (int)($options['wildcard_row_budget'] ?? $this->wildcardRowBudget);
+        if (isset($options['compound_numbers'])) $this->compoundNumbers = $options['compound_numbers'] === 'words' ? 'words' : 'phrase';
         $hfCutoff    = (float)($options['highfreq_cutoff'] ?? $this->highfreqCutoff);
         $candLimit   = (int)($options['candidate_limit'] ?? $this->candidateLimit);
         $p1Limit     = (int)($options['phase1_limit'] ?? $this->phase1Limit);
@@ -1324,18 +1458,24 @@ class Searcher
             static $QUESTION_WORDS = ['how','what','which','who','whom','whose','when','where','why'];
             $hasQuestion = (bool)array_intersect($QUESTION_WORDS, array_merge($required, $optional));
 
+            // One typed positive word (a required one counts), no wildcard.
+            // Excluded words add no ranking signal, so "python -snake" is
+            // still a single-word query for routing purposes.
+            $isSingleWord = count(array_unique(array_merge($required, $optional))) === 1;
+            // The shape-based pick (see the auto_*_algo knobs); typo evidence
+            // is decided after fuzzy expansion and can override it.
+            $shapeAlgo = $hasQuestion ? $rk['auto_question_algo']
+                       : ($isSingleWord ? $rk['auto_single_word_algo'] : $rk['auto_default_algo']);
             if ($hasWildcards) {
-                $algo = 'freq';
+                $algo = $rk['auto_wildcard_algo'];
             } elseif ($confidence < 100) {
-                // Defer: becomes 'freq' if the fuzzy machinery finds typo
-                // evidence, otherwise falls back per shape. Resolved right
-                // after the fuzzy noise filter (search for AUTO_PENDING).
+                // Defer: becomes auto_typo_algo if the fuzzy machinery finds
+                // typo evidence, otherwise falls back per shape. Resolved
+                // right after the fuzzy noise filter (search for AUTO_PENDING).
                 $algo = self::AUTO_PENDING;
-                $autoFallback = $hasQuestion ? 'bm25f' : 'cover';
-            } elseif ($hasQuestion) {
-                $algo = 'bm25f';
+                $autoFallback = $shapeAlgo;
             } else {
-                $algo = 'cover';
+                $algo = $shapeAlgo;
             }
         }
 
@@ -1451,9 +1591,13 @@ class Searcher
         if ($collectDiag && $doStem) {
             foreach ([$reqStemGroups, $optStemGroups] as $diagGroups) {
                 foreach ($diagGroups as $diagOrig => $diagForms) {
+                    // Array keys: PHP stores "19" as int 19, so cast before
+                    // comparing — "19" !== 19 used to report every numeric
+                    // word as a stem variant of itself.
+                    $diagOrig = (string)$diagOrig;
                     foreach ($diagForms as $diagF) {
-                        if ($diagF !== $diagOrig) {
-                            $diagExp[] = ['term' => $diagF, 'from' => $diagOrig,
+                        if ((string)$diagF !== $diagOrig) {
+                            $diagExp[] = ['term' => (string)$diagF, 'from' => $diagOrig,
                                           'class' => 'stem', 'boost' => round($boosts[$diagF] ?? 1.0, 3)];
                         }
                     }
@@ -1469,6 +1613,27 @@ class Searcher
         // Recording is cheap and unconditional; the scoring changes are gated.
         $conceptOf     = [];   // term => concept key
         $conceptWeight = [];   // concept key => weight (user boost)
+        // Concept weights are the user's boosts, nothing more. Three ways of
+        // weighting concepts by what they are were built and measured on 215
+        // labelled queries (2026-09-10, tmp/autotune) and none survived:
+        //  - by IDF ("rare words matter more"): +0.010 MRR on hand-labelled
+        //    queries, -0.018 on agent-labelled ones. Rarity is not topicality:
+        //    "biggest" is rarer than "volcano", so IDF weighting hands the
+        //    slot to the adjective and "biggest volcano" fell from rank 4 to
+        //    24. Pinning numbers, codes and near-unique tokens to the lowest
+        //    weight did not rescue it (wash).
+        //  - by how many titles a word heads ("title-hit"): -0.086, the
+        //    worst of anything tried. Words heading many titles are the
+        //    GENERIC ones — mountain, river, great — so "himalayas mountains"
+        //    lost to List of mountains in the Andes. Title frequency measures
+        //    genericness, the inverse of what was wanted.
+        //  - digit-bearing words at half weight, and/or excluded from the
+        //    title bonus: -0.004 to -0.015 overall, -0.04 to -0.14 on numeric
+        //    queries. Codes are where digits matter most in titles: "k2
+        //    mountain" lost K2 entirely, "cop26 glasgow 2021" fell 1 -> 23.
+        // What separates "volcano" from "biggest" is topic vs modifier, which
+        // no term statistic encodes; the working levers for the common-word
+        // problem are stopword removal and the routing table.
         foreach ($required as $t) {
             $conceptWeight['r:' . $t] = $boosts[$t] ?? 1.0;
             foreach (($reqStemGroups[$t] ?? [$t]) as $f) $conceptOf[$f] ??= 'r:' . $t;
@@ -1490,7 +1655,13 @@ class Searcher
                 foreach ($synonyms as $group) {
                     if (in_array($term, $group)) {
                         foreach ($group as $syn) {
-                            if ($syn !== $term && !in_array($syn, $optional)) {
+                            // An excluded word is never added back as a synonym:
+                            // "java -island -coffee" used to add coffee (java's
+                            // WordNet group) as an optional term, fetch its postings
+                            // and list it under "Also searched", while every doc it
+                            // matched was then dropped by the exclusion — pure waste
+                            // and a contradiction on screen.
+                            if ($syn !== $term && !in_array($syn, $optional) && !in_array($syn, $excluded, true)) {
                                 $optional[] = $syn;
                                 $boosts[$syn] = $boosts[$syn] ?? ($boosts[$term] ?? 1.0);
                                 // a synonym is a FORM of the term that triggered it
@@ -1520,7 +1691,7 @@ class Searcher
                 $term = $group[0] ?? null;
                 if ($term === null || !in_array($term, $optional, true)) continue;
                 foreach (array_slice($group, 1) as $d) {
-                    if (in_array($d, $optional, true) || in_array($d, $required, true)) continue;
+                    if (in_array($d, $optional, true) || in_array($d, $required, true) || in_array($d, $excluded, true)) continue;
                     $optional[] = $d;
                     $boosts[$d] = $rk['derivation_boost'] * ($boosts[$term] ?? 1.0);
                     $conceptOf[$d] ??= $conceptOf[$term] ?? 'o:' . $term;
@@ -1586,7 +1757,7 @@ class Searcher
             $conceptWeight['rw:' . $prefix] = $boost;   // one concept per prefix
             $expanded = [];
             foreach (array_keys($fields) as $field) {
-                foreach ($this->expandPrefix($field, $prefix, $maxWild) as $t) {
+                foreach ($this->expandPrefix($field, $prefix, $maxWild, $wildBudget, $hfCutoff) as $t) {
                     $expanded[] = $t;
                     $boosts[$t] = $boosts[$t] ?? $boost;
                     $conceptOf[$t] ??= 'rw:' . $prefix;
@@ -1638,7 +1809,24 @@ class Searcher
         // $fuzzyByOrigin records which typed word produced each variant, so
         // the noise filter below compares every term against ITS OWN variants.
         $fuzzyByOrigin = [];
-        $fuzzyResult = $this->expandFlat($typedOptional, $confidence, $maxFuzzy, $fuzzyByOrigin, $rk['fuzzy_decay']);
+        // Tokens containing a digit are never fuzzy-expanded. Every term gets
+        // an edit budget of at least 1, so "1" expanded to "10".."19" — ten of
+        // the commonest tokens in the corpus, ~440K body rows for a
+        // one-character query — and the noise filter (3x the original's df)
+        // could not catch it because "1" itself is in 66K docs. "19" is not a
+        // typo for "1", and a year should match exactly; the cost is that
+        // "19998" no longer finds 1998. The rule started as pure numbers and
+        // widened to anything with a digit after the agent study (2026-09-10)
+        // saw "co2" fuzzed to cod and cob and "c4" to a car and a TV channel:
+        // codes, formulas and model numbers are exact things too, and a
+        // one-edit neighbour of "co2" is never a spelling of it. Such terms
+        // keep stemming/synonym handling (no-ops for them) and enter the
+        // fuzzy map at boost 1.0 like any exact match.
+        $numericExact = array_values(array_filter($typedOptional,
+            fn($t) => preg_match('/\p{N}/u', $t) === 1));
+        $fuzzyResult = $this->expandFlat(array_values(array_diff($typedOptional, $numericExact)),
+                                         $confidence, $maxFuzzy, $fuzzyByOrigin, $rk['fuzzy_decay']);
+        foreach ($numericExact as $nt) $fuzzyResult[$nt] = 1.0;
         // fuzzy variants are forms of the term that produced them
         foreach ($fuzzyByOrigin as $origin => $variants) {
             foreach (array_keys($variants) as $v) {
@@ -1859,7 +2047,7 @@ class Searcher
             $typedCount   = max(1, count(array_unique($typedOptional)));
             $typoEvidence = $suspectCount > 0
                 && ($suspectCount / $typedCount) >= $rk['auto_typo_fraction'];
-            $algo = $typoEvidence ? 'freq' : $autoFallback;
+            $algo = $typoEvidence ? $rk['auto_typo_algo'] : $autoFallback;
             if ($collectDiag) $diagAuto = ['typo_evidence' => $typoEvidence,
                 'suspects' => array_keys($suspects), 'typed_words' => $typedCount];
         }
@@ -1917,6 +2105,7 @@ class Searcher
 
         $excByField = [];
         $optByField = [];
+        $wildTermSet = [];   // optional wildcard completions — exempt from the fuzzy-noise cut below
 
         foreach (array_keys($fields) as $field) {
             $excTerms = $excExpanded;   // exact excluded terms only (see above)
@@ -1925,8 +2114,9 @@ class Searcher
             $optTerms = $optExpanded;
             foreach ($optWild as $prefix => $boost) {
                 $conceptWeight['ow:' . $prefix] = $boost;   // one concept per prefix
-                $expanded = $this->expandPrefix($field, $prefix, $maxWild);
+                $expanded = $this->expandPrefix($field, $prefix, $maxWild, $wildBudget, $hfCutoff);
                 foreach ($expanded as $t) {
+                    $wildTermSet[$t] = true;
                     $boosts[$t] = $boosts[$t] ?? $boost;
                     $conceptOf[$t] ??= 'ow:' . $prefix;
                 }
@@ -1979,7 +2169,8 @@ class Searcher
             // expansions, required terms, synonym/morph additions. We diff against
             // the REQUESTED list, not the found keys, so terms absent from this
             // field aren't pointlessly re-queried.
-            $allFieldTerms = array_unique(array_merge($allReqExpanded, $optByField[$field]));
+            $allFieldTerms = array_unique(array_merge($allReqExpanded, $optByField[$field],
+                                                     $excByField[$field], $excPhraseWords));
             $cached  = $prefetchedTermStats[$field] ?? [];
             $missing = array_diff($allFieldTerms, $prefetchRequested);
             $termStatsByF[$field] = $cached + (!empty($missing) ? $this->fetchTermStats($field, $missing) : []);
@@ -1999,9 +2190,17 @@ class Searcher
             }
             $fuzzyThreshold = max(1000, $origMaxFreq * 3); // 3x original or 1000, whichever is higher
 
-            $optByField[$field] = array_values(array_filter($candidates, function($t) use ($docFreqs, $corpusThreshold, $fuzzyThreshold, $originalTerms, $fuzzyPromotedTerms, $rk) {
+            // Wildcard completions are exempt from the fuzzy-noise cut: a
+            // completion's frequency is not evidence of noise the way a fuzzy
+            // variant's is — it IS what the user asked for. Before 3.7 this cut
+            // silently removed every completion in >1000 docs from a pure
+            // wildcard query (origMaxFreq is 0 there), so "computer" could never
+            // survive comp* whatever the expansion order. The corpus-stopword
+            // cut still applies (expandPrefix already enforces it per field).
+            $optByField[$field] = array_values(array_filter($candidates, function($t) use ($docFreqs, $corpusThreshold, $fuzzyThreshold, $originalTerms, $fuzzyPromotedTerms, $rk, $wildTermSet) {
                 $df = $docFreqs[$t] ?? 0;
                 if ($df > $corpusThreshold) return false; // corpus stopword
+                if (isset($wildTermSet[$t])) return true;  // wildcard completion
                 // noise_exempt_promoted: a variant the swap just promoted IS
                 // the user's intended word — filtering it back out for being
                 // common in this field undoes the correction (promoted
@@ -2019,104 +2218,195 @@ class Searcher
             }
         }
 
-        // --- Fetch postings ---
-        // Two modes controlled by $twoPhase option:
+        // --- Candidate retrieval: compact first pass, then survivors only ---
         //
-        // DEFAULT ($twoPhase = false): Fetch ALL fields' postings upfront.
-        //   Complete — finds every doc mentioning query terms in any field.
-        //   Slower for broad queries (the Wikipedia body postings table runs
-        //   to tens of millions of rows).
+        // Memory here used to be proportional to the SUM of document
+        // frequencies of every fetched term, at ~450 bytes per posting row
+        // held as [docId][term] => freq. The 25% cutoff bounded optional
+        // terms, but nothing bounded required/phrase words ("the united
+        // states of america": 662K body rows, 334 MB) or excluded words
+        // ("solar -the": 300 MB), and twenty ordinary words summed past
+        // 128 MB anyway. Yet the only thing read before the coverage prune
+        // was "which ORIGINAL query words does this doc contain" — a few bits.
         //
-        // OPTIONAL ($twoPhase = true): Two-phase retrieval.
-        //   Phase 1: fetch the light fields only, prune to the top phase1_limit
-        //   candidates. Phase 2: fetch heavy_fields postings for survivors only.
-        //   ~2x faster but can miss docs that mention terms only in a heavy
-        //   field. Good for web search UIs where top 10-50 results matter most.
-
-        $fieldPostings = [];
-
-        // Heavy fields come from the corpus profile instead of a hardcoded
-        // 'body'. Two-phase only makes sense when there is at least one heavy
-        // field to defer AND at least one light field to seed candidates from;
-        // otherwise fall back to standard single-phase retrieval.
+        // Now, in three steps:
+        //  1. Required groups, rarest first. The rarest group is streamed
+        //     broadly and defines the candidate set; every later group is
+        //     looked up only for the survivors, which can only shrink
+        //     ("america" 12.8K docs -> +states 5.2K -> +united 5.1K -> ...).
+        //     A result must contain every required word, so this loses
+        //     nothing. When even the rarest group is above highfreq_cutoff
+        //     (no anchor: "of the") it is streamed with a broad_cap per
+        //     field and the result is flagged truncated — a sample, which is
+        //     all a stopword-only phrase deserves.
+        //  2. Optional terms add coverage bits (restricted to the survivors
+        //     when step 1 ran). One int per doc, ~40 bytes, instead of a row
+        //     per (doc, term).
+        //  3. Prune by bit count, then materialize full postings for the
+        //     survivors only — the same doc-limited fetch two-phase mode
+        //     always used for heavy fields. Excluded words and exclusion-
+        //     phrase words are fetched HERE and nowhere else: exclusion has
+        //     always been applied after the prune (see the scoring loop), so
+        //     their broad fetch bought nothing but memory and a candidate
+        //     pool polluted with docs that matched only an excluded word.
+        //
+        // Two-phase mode is the same pipeline with the optional stream
+        // limited to the light fields and the prune limit set to
+        // phase1_limit; required groups are still resolved across all
+        // fields, so a required word found only in a heavy field no longer
+        // drops the doc (a small recall gain over the old two-phase).
         $heavyActive = array_values(array_intersect($heavyFields, array_keys($fields)));
         $lightFields = array_values(array_diff(array_keys($fields), $heavyActive));
+        $useTwoPhase = $twoPhase && !empty($heavyActive) && !empty($lightFields);
+        $optFields   = $useTwoPhase ? $lightFields : array_keys($fields);
+        $pruneLimit  = $useTwoPhase ? $p1Limit : $candLimit;
 
-        // Coverage-prune inputs computed ONCE — both retrieval branches
-        // below prune candidates the same way (see pruneByCoverage()); each
-        // branch used to recompute this list inline.
-        $coverageTerms = array_unique(array_merge($required, $presynOptional));
-
-        if ($twoPhase && !empty($heavyActive) && !empty($lightFields)) {
-            // --- Two-phase mode ---
-            // Phase 1: light fields (small, fast)
-            foreach ($lightFields as $field) {
-                $fetchTerms = array_unique(array_merge(
-                    $allReqExpanded,
-                    $excByField[$field],
-                    $excPhraseWords,   // phrase-exclusion words per field
-                    $optByField[$field]
-                ));
-                $fieldPostings[$field] = $this->fetchPostings($field, $fetchTerms);
-            }
-
-            // Collect candidates from light fields
-            $allDocs = [];
-            foreach ($fieldPostings as $postings) {
-                foreach (array_keys($postings) as $docId) {
-                    $allDocs[$docId] = true;
+        // Coverage = how many of the user's ORIGINAL words a doc contains
+        // (expanded wildcard/fuzzy/morph terms don't count — they enter the
+        // candidate set at coverage 0). One bit per original word; past 62
+        // words the rest count 0, which only affects the prune order of
+        // absurdly long queries.
+        $coverageTerms = array_values(array_unique(array_merge($required, $presynOptional)));
+        $bitOf = [];
+        foreach ($coverageTerms as $i => $ct) $bitOf[$ct] = $i < 62 ? (1 << $i) : 0;
+        // An optional wildcard prefix is one concept and gets one bit too, so a
+        // doc matching any of its completions counts as covering it. Without
+        // this a pure wildcard query had no coverage words, the prune was
+        // disabled, and every matched doc was scored — commonest-first
+        // expansion of "s*" then took 19 s and 740 MB (3.7 study). Ties at the
+        // cap keep stream order (title field first), so docs carrying the
+        // prefix in their title survive the cut before body-only matches.
+        $hasCoverage = !empty($coverageTerms);
+        if (!empty($optWild) || !empty($reqWild)) {
+            $nb = count($coverageTerms);
+            foreach (array_keys($optWild) as $wp) {
+                $bit = $nb < 62 ? (1 << $nb) : 0; $nb++;
+                foreach ($optByField as $obf) {
+                    foreach ($obf as $t) if (($conceptOf[$t] ?? null) === 'ow:' . $wp) $bitOf[$t] = $bit;
                 }
             }
-
-            // Phase 1 pruning: rank by coverage, keep top survivors.
-            // Tuned via benchmarking (two-phase retrieval experiment):
-            //   500  → 9.6s total, 18MB | 1000 → 12.4s, 20MB | 2000 → 17.2s, 24MB
-            // The limit is config ('phase1_limit', default 1000). The prune loop
-            // lives in pruneByCoverage(): it was once duplicated near-verbatim
-            // in the standard branch below, so a fix to one prune (tie-breaking,
-            // say) would silently miss the other.
-            $prunedCandidates = $this->pruneByCoverage(
-                $allDocs, $fieldPostings, $lightFields, $coverageTerms, $p1Limit
-            );
-
-            // Phase 2: heavy-field postings for survivors only
-            $survivorIds = array_keys($prunedCandidates);
-            foreach ($heavyActive as $hf) {
-                $heavyTerms = array_unique(array_merge(
-                    $allReqExpanded,
-                    $excByField[$hf] ?? [],
-                    $excPhraseWords,   // phrase-exclusion words
-                    $optByField[$hf] ?? []
-                ));
-                $fieldPostings[$hf] = $this->fetchPostingsForDocs($hf, $heavyTerms, $survivorIds);
+            // Required prefixes too (+s*): every survivor matches them by
+            // construction, but without a bit a pure "+prefix*" query had no
+            // coverage at all and skipped the prune — 40K docs scored, 166 MB.
+            foreach (array_keys($reqWild) as $wp) {
+                $bit = $nb < 62 ? (1 << $nb) : 0; $nb++;
+                foreach ($reqExpansions[$wp . '*'] ?? [] as $t) $bitOf[$t] = $bit;
             }
-        } else {
-            // --- Standard mode: fetch all fields upfront ---
-            foreach (array_keys($fields) as $field) {
-                $fetchTerms = array_unique(array_merge(
-                    $allReqExpanded,
-                    $excByField[$field],
-                    $excPhraseWords,   // phrase-exclusion words per field
-                    $optByField[$field]
-                ));
-                $fieldPostings[$field] = $this->fetchPostings($field, $fetchTerms);
-            }
+            $hasCoverage = true;
+        }
 
-            // Collect all candidate doc_ids
-            $allDocs = [];
-            foreach ($fieldPostings as $postings) {
-                foreach (array_keys($postings) as $docId) {
-                    $allDocs[$docId] = true;
+        // A required group anchors the intersection when its rows across
+        // the active fields fit the same fraction of the corpus the
+        // highfreq_cutoff allows an optional term.
+        $maxTotalDocs  = max(array_column($fieldStats, 'total_docs') ?: [0]);
+        $anchorMaxRows = $hfCutoff >= 1.0 ? PHP_INT_MAX : (int)($maxTotalDocs * $hfCutoff);
+
+        $masks     = [];     // docId => coverage bitmask
+        $survivors = null;   // docId => true once required groups constrain the set
+        $truncated = false;
+
+        // Verify required groups (in $keys order) on $set: a doc leaves $set
+        // — and the candidate masks — the first time a group has no row for
+        // it in any active field. Returns the survivors.
+        $intersect = function (array $set, array $keys) use (&$masks, $bitOf, $reqExpansions, $fields): array {
+            foreach ($keys as $key) {
+                if (empty($set)) break;
+                $hit = [];
+                foreach (array_keys($fields) as $f) {
+                    $this->streamMasks($f, $reqExpansions[$key], $set, $masks, $bitOf, $hit, 0, $this->groupRowsMemo[$key] ?? 0);
+                }
+                foreach (array_keys($set) as $d) {
+                    if (!isset($hit[$d])) unset($masks[$d]);
+                }
+                $set = $hit;
+            }
+            return $set;
+        };
+
+        if (!empty($reqExpansions)) {
+            $groupRows = [];
+            foreach ($reqExpansions as $key => $gTerms) {
+                $n = 0;
+                foreach (array_keys($fields) as $f) {
+                    foreach ($gTerms as $t) $n += $termStatsByF[$f][$t] ?? 0;
+                }
+                $groupRows[$key] = $n;
+            }
+            asort($groupRows);
+            $this->groupRowsMemo = $groupRows;
+            $orderedKeys = array_keys($groupRows);
+            $anchorKey   = $orderedKeys[0];
+            $restKeys    = array_slice($orderedKeys, 1);
+
+            if ($broadCap <= 0 || $groupRows[$anchorKey] <= $anchorMaxRows) {
+                // A rare required word anchors the intersection. Complete.
+                $hit = [];
+                foreach (array_keys($fields) as $f) {
+                    $this->streamMasks($f, $reqExpansions[$anchorKey], null, $masks, $bitOf, $hit);
+                }
+                $survivors = $intersect($hit, $restKeys);
+            } else {
+                // Every required word is common ("beethoven +the", "of the",
+                // "with you" song). Ranking must not depend on which slice of
+                // "the" we happened to sample, so: seed from the OPTIONAL
+                // words (bounded by highfreq_cutoff), verify every required
+                // group on that seed — complete for every doc that matches an
+                // optional word — then top up with a broad_cap sample of the
+                // rarest required word so a stopword-only query still
+                // returns something. The top-up is the only sampled part.
+                $truncated = true;
+                $seed = [];
+                foreach ($optFields as $f) {
+                    if (!empty($optByField[$f])) {
+                        $this->streamMasks($f, $optByField[$f], null, $masks, $bitOf, $seed);
+                    }
+                }
+                $survivors = $intersect($seed, $orderedKeys);
+
+                if ($pruneLimit <= 0 || count($survivors) < $pruneLimit) {
+                    $sample = [];
+                    foreach (array_keys($fields) as $f) {
+                        $this->streamMasks($f, $reqExpansions[$anchorKey], null, $masks, $bitOf, $sample, $broadCap);
+                    }
+                    $sample    = array_diff_key($sample, $survivors);
+                    $survivors += $intersect($sample, $restKeys);
                 }
             }
+            if (empty($survivors)) $masks = [];
+        }
 
-            // Prune by original-term coverage (WAND-style).
-            // The limit is config ('candidate_limit', default 5000); 0 = score
-            // everything. See the twin pruneByCoverage() call in the two-phase
-            // branch above.
-            $prunedCandidates = $this->pruneByCoverage(
-                $allDocs, $fieldPostings, array_keys($fields), $coverageTerms, $candLimit
-            );
+        // Optional words add coverage bits. Under a required query only the
+        // survivors can receive them (the seed docs above already have
+        // theirs; OR-ing again is idempotent and the top-up docs need it).
+        if ($survivors === null || !empty($survivors)) {
+            foreach ($optFields as $f) {
+                if (empty($optByField[$f])) continue;
+                $rows = 0;
+                foreach ($optByField[$f] as $t) $rows += $termStatsByF[$f][$t] ?? 0;
+                $unused = null;
+                $this->streamMasks($f, $optByField[$f], $survivors, $masks, $bitOf, $unused, 0, $rows);
+            }
+        }
+
+        $matchedCount     = count($masks);
+        $prunedCandidates = $this->pruneByMask($masks, $pruneLimit, $hasCoverage);
+        unset($masks, $survivors);
+
+        // Materialize [docId][term] => freq for the survivors only. Same
+        // shape the scorers, passesRequired() and passesExcluded() always
+        // read; they never touched non-survivors anyway.
+        $fieldPostings = [];
+        $survivorIds   = array_keys($prunedCandidates);
+        foreach (array_keys($fields) as $field) {
+            $fetchTerms = array_values(array_unique(array_merge(
+                $allReqExpanded,
+                $excByField[$field],
+                $excPhraseWords,   // phrase-exclusion words per field
+                $optByField[$field]
+            )));
+            $rows = 0;
+            foreach ($fetchTerms as $t) $rows += $termStatsByF[$field][$t] ?? 0;
+            $fieldPostings[$field] = $this->fetchPostingsForDocs($field, $fetchTerms, $survivorIds, $rows);
         }
 
         // --- Positional phrase data ---
@@ -2139,8 +2429,9 @@ class Searcher
         }
 
         if ($collectDiag) {
-            $diagCand = ['matched' => count($allDocs), 'scored' => count($prunedCandidates),
-                         'wildcard_excluded_docs' => count($excludedDocIds)];
+            $diagCand = ['matched' => $matchedCount, 'scored' => count($prunedCandidates),
+                         'wildcard_excluded_docs' => count($excludedDocIds),
+                         'truncated' => $truncated];
         }
 
         // --- Pre-fetch stats for IDF/BM25 ---
@@ -2397,7 +2688,7 @@ class Searcher
                     $tStats      = $termStatsByF[$field]  ?? [];
                     $dl          = $docLengths[$docId][$field] ?? 1;
 
-                    $result = $this->scoreDoc($docPostings, $scoreTerms, $algo, $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, $fieldConcepts[$field] ?? null);
+                    $result = $this->scoreDoc($docPostings, $scoreTerms, $algo, $fStats, $tStats, $dl, $boosts, $field, $boostTotalByField[$field], $rk, $fieldConcepts[$field] ?? null, $conceptOf);
 
                     $fieldScores[$docId][$field] = round($result['score'], 4);
                     $matches[$docId][$field]     = $result['matches'];
@@ -2823,6 +3114,7 @@ class Searcher
                     'excluded'       => $excluded,
                     'req_phrases'    => $reqPhrases,
                     'exc_phrases'    => $excPhrases,
+                    'numeric_exact'  => $numericExact,
                 ],
                 'algo' => ['requested' => $requestedAlgo, 'resolved' => $algo]
                           + ($diagAuto ?? []),
@@ -2845,49 +3137,133 @@ class Searcher
     // =========================================================================
 
     /**
-     * WAND-style candidate pruning: when more than $limit docs match, keep the
-     * $limit best by how many of the user's ORIGINAL query terms they contain
-     * (expanded wildcard/fuzzy terms don't count — coverage of the user's
-     * actual words is the relevance proxy). $limit <= 0 disables pruning.
+     * WAND-style candidate pruning on coverage bitmasks: when more than
+     * $limit docs match, keep the $limit best by how many of the user's
+     * ORIGINAL query words they contain (set bits). $limit <= 0 disables
+     * pruning. (Pure-wildcard queries have no coverage WORDS but each optional
+     * prefix carries a bit of its own since 3.7, so they prune too.)
      *
-     * Returns [docId => true, ...] — same shape as the $allDocs input.
+     * Returns [docId => true, ...].
      *
-     * Known limitation (pre-existing, unchanged by the extraction): docs TIED
-     * on coverage at the cut boundary survive in postings-fetch order, which
-     * is doc-id order — arbitrary but deterministic for a given index. Fixing
-     * tie-breaking now only needs to happen HERE.
-     *
-     * Extracted from two near-identical ~25-line inline blocks (two-phase
-     * branch pruning to phase1_limit over light fields; standard branch pruning
-     * to candidate_limit over all fields). The blocks had already started to
-     * drift cosmetically; a behavioral fix to one would have silently missed
-     * the other.
+     * Ties at the cut boundary survive in stream order — field order, then
+     * the postings B-tree order within a field (doc-id order per term).
+     * Arbitrary but deterministic for a given index; the bucket walk below
+     * is stable, so fixing tie-breaking only needs to happen HERE.
      */
-    private function pruneByCoverage(
-        array $allDocs,
-        array $fieldPostings,
-        array $fieldList,
-        array $originalTerms,
-        int $limit
-    ): array {
-        if ($limit <= 0 || count($allDocs) <= $limit || count($originalTerms) === 0) {
-            return $allDocs;
+    private function pruneByMask(array $masks, int $limit, bool $hasCoverageTerms): array
+    {
+        if ($limit <= 0 || !$hasCoverageTerms || count($masks) <= $limit) {
+            return array_fill_keys(array_keys($masks), true);
         }
-        $docCoverage = [];
-        foreach (array_keys($allDocs) as $docId) {
-            $matched = 0;
-            foreach ($originalTerms as $ot) {
-                foreach ($fieldList as $field) {
-                    if (isset($fieldPostings[$field][$docId][$ot])) {
-                        $matched++;
-                        break;
+        $buckets = [];   // set-bit count => [docId, ...] in stream order
+        foreach ($masks as $docId => $m) {
+            $c = 0;
+            while ($m) { $m &= $m - 1; $c++; }
+            $buckets[$c][] = $docId;
+        }
+        krsort($buckets);
+        $out = [];
+        foreach ($buckets as $ids) {
+            foreach ($ids as $d) {
+                $out[$d] = true;
+                if (count($out) >= $limit) return $out;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Stream (doc_id, term) rows for $terms in one field into coverage
+     * bitmasks: $masks[docId] |= $bitOf[term]. Nothing per row is kept —
+     * the freq column isn't even selected — so memory is one int per
+     * distinct doc, not one array per row.
+     *
+     * $docFilter  null = every doc containing a term is a candidate (adds
+     *             entries). Non-null [docId => true] = only those docs
+     *             (never adds entries outside the set) — how required
+     *             groups after the anchor, and optional terms under a
+     *             required query, stay bounded.
+     * $hit        when given, receives [docId => true] for every doc that
+     *             had a row — the intersection survivors.
+     * $capPerTerm > 0 = at most this many rows for the whole term list in this
+     *             field (doc-id order, spent term by term): the broad_cap sample
+     *             for anchor-less required queries.
+     * $rowsEstimate  sum of the terms' doc frequencies, used with a filter
+     *             to pick between seeking each (term, doc) pair and
+     *             scanning the terms' ranges while filtering in PHP.
+     *             Seeks cost ~|filter| x |terms| probes; the scan costs
+     *             one row per posting. Whichever is smaller wins.
+     */
+    private function streamMasks(
+        string $field, array $terms, ?array $docFilter, array &$masks, array $bitOf,
+        ?array &$hit = null, int $capPerTerm = 0, int $rowsEstimate = 0
+    ): void {
+        if (empty($terms)) return;
+        if ($docFilter !== null && empty($docFilter)) return;
+        $table = "postings_$field";
+        $terms = array_values(array_unique($terms));
+
+        // Measured on the Wikipedia index: a PK probe costs ~4 µs with the
+        // ids sorted (B-tree pages visited in order; ~2x that unsorted), a
+        // scanned row ~0.65 µs — so a probe is worth about six rows.
+        $seek = $docFilter !== null
+             && ($rowsEstimate <= 0
+                 || count($docFilter) * count($terms) * self::SEEK_COST_ROWS <= $rowsEstimate);
+
+        if ($seek) {
+            $docIds = array_keys($docFilter);
+            sort($docIds);
+            foreach (array_chunk($terms, self::BATCH_SIZE) as $termBatch) {
+                $termPh = implode(',', array_fill(0, count($termBatch), '?'));
+                foreach (array_chunk($docIds, self::BATCH_SIZE) as $docBatch) {
+                    $docPh = implode(',', array_fill(0, count($docBatch), '?'));
+                    $stmt  = $this->db->prepare(
+                        "SELECT doc_id, term FROM $table WHERE term IN ($termPh) AND doc_id IN ($docPh)"
+                    );
+                    $stmt->execute(array_merge($termBatch, $docBatch));
+                    while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
+                        $masks[$row[0]] = ($masks[$row[0]] ?? 0) | ($bitOf[$row[1]] ?? 0);
+                        if ($hit !== null) $hit[$row[0]] = true;
                     }
                 }
             }
-            $docCoverage[$docId] = $matched;
+            return;
         }
-        arsort($docCoverage);
-        return array_fill_keys(array_keys(array_slice($docCoverage, 0, $limit, true)), true);
+
+        if ($capPerTerm > 0) {
+            // The cap is a budget for the whole term GROUP in this field, spent
+            // term by term: a required word is one term, but a required
+            // wildcard (+s*) is up to 100 common completions, and a per-term
+            // cap turned into 300 x 20K = 6M mask entries (676 MB, 18 s) the
+            // day wildcards went commonest-first. One statement per term so
+            // LIMIT can carry the remaining budget.
+            $remaining = $capPerTerm;
+            foreach ($terms as $t) {
+                if ($remaining <= 0) break;
+                $stmt = $this->db->prepare(
+                    "SELECT doc_id, term FROM $table WHERE term = ? LIMIT " . (int)$remaining
+                );
+                $stmt->execute([$t]);
+                while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
+                    $remaining--;
+                    if ($docFilter !== null && !isset($docFilter[$row[0]])) continue;
+                    $masks[$row[0]] = ($masks[$row[0]] ?? 0) | ($bitOf[$row[1]] ?? 0);
+                    if ($hit !== null) $hit[$row[0]] = true;
+                }
+            }
+            return;
+        }
+
+        foreach (array_chunk($terms, self::BATCH_SIZE) as $batch) {
+            $ph   = implode(',', array_fill(0, count($batch), '?'));
+            $stmt = $this->db->prepare("SELECT doc_id, term FROM $table WHERE term IN ($ph)");
+            $stmt->execute($batch);
+            while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
+                if ($docFilter !== null && !isset($docFilter[$row[0]])) continue;
+                $masks[$row[0]] = ($masks[$row[0]] ?? 0) | ($bitOf[$row[1]] ?? 0);
+                if ($hit !== null) $hit[$row[0]] = true;
+            }
+        }
     }
 
     /**
@@ -3074,8 +3450,12 @@ class Searcher
         string $field = '',
         float $totalBoostWeight = -1.0,
         array $rk = [],
-        ?array $concepts = null
+        ?array $concepts = null,
+        array $conceptOf = []
     ): array {
+        // $conceptOf = term → concept key for every query term (always passed
+        // by the generic scoring call, independent of the concept_coverage
+        // flag); the idf case uses it to recognise wildcard completions.
         // $concepts = ['of' => term→concept, 'weight' => concept→weight,
         // 'total' => Σ concept weights] — concept-based coverage accounting
         // (see the 'concept_coverage' ranking flag). null = per-term (default).
@@ -3103,6 +3483,7 @@ class Searcher
         $matchedTerms   = [];
         $matchedBoost   = 0.0;
         $conceptMatched = [];   // concept key => best matched form boost
+        $wildRarest     = [];   // idf only: wildcard prefix concept => idf x boost of its rarest matched completion
 
         foreach ($scoreTerms as $term) {
             $tf = $docPostings[$term] ?? 0;
@@ -3136,6 +3517,38 @@ class Searcher
                     break;
 
                 case 'idf':
+                    // A wildcard prefix is ONE concept to the user, so Rarity
+                    // credits a document with the rarest completion it contains,
+                    // once, rather than summing every completion it happens to
+                    // use. Summing turned Rarity into a breadth count on
+                    // wildcards: "un*" put Uncertainty principle first on the
+                    // strength of twelve ordinary un- words, and a page built
+                    // around one genuinely rare completion could never win.
+                    // With the rarest-completion rule Rarity becomes the tool
+                    // for the uncommon end of a word family — neuro* gives
+                    // Neuroethology and Neuropeptide where Coverage gives Neuron
+                    // and Neurology — which is what "rare words weigh more" ought
+                    // to mean for a prefix.
+                    //
+                    // Tried and set aside (2026-09-10, measured in a tmp harness):
+                    //  - changing MEMBERSHIP instead (adding the 30 rarest
+                    //    completions to the candidate set, with and without a
+                    //    document floor / digit filter / title-word filter). Under
+                    //    summed scoring the rare group reached 1-5 of Rarity's top
+                    //    50 even with the prune off — breadth beat rarity anyway.
+                    //    Under this rule it added a deeper but arbitrary tail
+                    //    (Compsognathus, CompuServe for comp*); not worth two knobs.
+                    //  - one shared IDF per prefix (from the union df): every
+                    //    match ties and Rarity says nothing on a bare wildcard.
+                    // Only idf: for freq the accumulation over completions is
+                    // the point (auto routes wildcards there), and the BM25
+                    // family and DFR are not presented as rarity tools. Typed
+                    // words and their fuzzy/stem/synonym forms are unaffected.
+                    $ck = $conceptOf[$term] ?? '';
+                    if ($ck !== '' && (str_starts_with($ck, 'ow:') || str_starts_with($ck, 'rw:'))) {
+                        $wildRarest[$ck] = max($wildRarest[$ck] ?? 0.0, ($this->termIdfByF[$field][$term] ?? 0.0) * $boost);
+                        break;
+                    }
                     // Pre-computed at build time (Builder::computeStats)
                     // Earlier: $idf = log(($N + 0.5) / (max(1, $tStats[$term] ?? 1) + 0.5) + 1);
                     $idf = $this->termIdfByF[$field][$term] ?? 0.0;
@@ -3185,6 +3598,7 @@ class Searcher
         if ($concepts !== null) {
             $matchedBoost = array_sum($conceptMatched);
         }
+        if (!empty($wildRarest)) $score += array_sum($wildRarest);   // idf: one credit per prefix
 
         switch ($algo) {
             case 'cover':
@@ -3237,7 +3651,9 @@ class Searcher
 
         $input = mb_strtolower($input);
         $input = preg_replace('/\s+/u', ' ', trim($input));
-        $input = preg_replace("/[^\p{L}\p{N}\p{M}\s'\"*+^.-]+/u", '', $input);
+        // ':' is kept so "10:30" reaches the compound-number rule below (the
+        // tokenizer splits it into 10 and 30 either way).
+        $input = preg_replace("/[^\p{L}\p{N}\p{M}\s'\"*+^.:-]+/u", '', $input);
 
         preg_match_all('/((?<=\s|^)(\+|-)"[^"]*"|"[^"]*"|\S+)/', $input, $m);
 
@@ -3285,13 +3701,47 @@ class Searcher
             // normalize WITHOUT splitting — a prefix is one unit ("co-op*" →
             // "coop*"); documented behavior choice.
             if ($isWild) {
-                $bare = implode('', $this->normalizeQueryTerm($bare));
+                // A hyphenated prefix splits like any hyphenated word: the last
+                // segment is the prefix, the rest are plain terms with the same
+                // operator ("object-orient*" -> object + orient*). The earlier
+                // rule joined the segments ("co-op*" -> "coop*") on the theory
+                // that a prefix is one unit, but the index tokenizes hyphens to
+                // spaces, so the joined form can never exist there:
+                // "object-orient*" returned nothing at all (agent study,
+                // 2026-09-10). "co-op*" now searches co + op*, which is at least
+                // the vocabulary the index holds.
+                $segs = $this->normalizeQueryTerm($bare);
+                $bare = (string)array_pop($segs);
+                foreach ($segs as $t) {
+                    if ($boost !== 1.0) $boosts[$t] = $boost;
+                    if      ($op === '+') $required[] = $t;
+                    elseif  ($op === '-') $excluded[] = $t;
+                    else                  $optional[] = $t;
+                }
                 if ($bare === '') continue;
                 if      ($op === '+') $req_wild[$bare] = $boost;
                 elseif  ($op === '-') $exc_wild[$bare] = $boost;
                 else                  $opt_wild[$bare] = $boost;
             } else {
-                foreach ($this->normalizeQueryTerm($bare) as $t) {
+                $parts = $this->normalizeQueryTerm($bare);
+                // A compound number — 3.14, 10:30, 192.168.0.1, 2024-05-01 — is
+                // stored by the tokenizer as its digit parts in sequence, so the
+                // faithful search is an adjacent phrase of those parts, not two
+                // or four independent numbers: "1.5 degrees warming" used to
+                // become the numbers 1 and 5 and returned a roller coaster named
+                // Limit and a 5-1 football score (agent study, 2026-09-10). On a
+                // non-positional index the phrase falls back to all-parts-in-one-
+                // field, still tighter than independent words. Only digits with
+                // . : / - separators qualify; "v2.0" or "f-16" stay ordinary
+                // words, and roman numerals are left as the words they are
+                // (Wikipedia titles say "World War II", not "World War 2").
+                if ($this->compoundNumbers === 'phrase' && count($parts) >= 2
+                    && preg_match('/^\p{N}+([.:\/-]\p{N}+)+$/u', $bare)) {
+                    if ($op === '-') $excludedPhrases[] = implode(' ', $parts);
+                    else             $requiredPhrases[] = implode(' ', $parts);
+                    continue;
+                }
+                foreach ($parts as $t) {
                     if ($boost !== 1.0) $boosts[$t] = $boost;
                     if      ($op === '+') $required[] = $t;
                     elseif  ($op === '-') $excluded[] = $t;
@@ -3356,10 +3806,13 @@ class Searcher
             }
         }
 
-        $required = array_values(array_unique(array_filter($required)));
-        $excluded = array_values(array_unique(array_filter($excluded)));
+        // Explicit '' test — a bare array_filter() also drops the string "0",
+        // so the query "0" (22K body docs) used to parse to nothing.
+        $notEmpty = fn($t) => $t !== '';
+        $required = array_values(array_unique(array_filter($required, $notEmpty)));
+        $excluded = array_values(array_unique(array_filter($excluded, $notEmpty)));
         $optional = array_values(array_unique(array_filter(
-            array_diff($optional, $required, $excluded)
+            array_diff($optional, $required, $excluded), $notEmpty
         )));
 
         return compact('required', 'excluded', 'optional', 'boosts', 'req_wild', 'exc_wild', 'opt_wild', 'exc_phrases', 'req_phrases');
@@ -3433,7 +3886,13 @@ class Searcher
                 'maxDist' => $maxDist,
                 'minLen'  => max(1, $len - $maxDist),
                 'maxLen'  => $len + $maxDist,
-                'chars'   => array_filter([$t[0] ?? '']),
+                // NOT array_filter([$t[0]]): PHP treats the string "0" as
+                // false, so every term starting with a zero ("000", "0x1f")
+                // lost its first-character bucket, was never returned by the
+                // candidate scan — not even as its own distance-0 match — and
+                // silently vanished from the query whenever confidence < 100
+                // ("000" found 196 docs instead of 14,509).
+                'chars'   => $t === '' ? [] : [$t[0]],
                 // Two-pass: also check second char to catch wrong-first-char typos
                 // (e.g., feinstein→einstein). Commented out for speed (~70ms/term).
                 // 'chars' => array_unique(array_filter([$t[0] ?? '', $t[1] ?? ''])),
@@ -3628,7 +4087,8 @@ class Searcher
     // Trade-off: for very narrow prefixes (e.g., "photosyn*"), the postings approach
     // might be faster since few rows match. But the difference is negligible
     // (<10ms) while the broad prefix case improves by 100x.
-    private function expandPrefix(string $field, string $prefix, int $maxExpansions = self::MAX_WILDCARD_EXPANSIONS): array
+    private function expandPrefix(string $field, string $prefix, int $maxExpansions = self::MAX_WILDCARD_EXPANSIONS,
+                                  int $rowBudget = self::WILDCARD_ROW_BUDGET, float $hfCutoff = 0.25): array
     {
         if ($prefix === '') return [];
 
@@ -3661,14 +4121,28 @@ class Searcher
 
         if (empty($candidates)) return [];
 
-        // Verify terms exist in this field via term_stats, and fetch doc_freq
-        // for max_expansions ranking. We prefer rarest terms (lowest doc_freq)
-        // because they're most discriminative — "thermodynamics" is more useful
-        // than "them" for ranking. Common terms also have near-zero IDF anyway.
+        // Verify the completions exist in this field via term_stats and fetch
+        // their doc_freq. Selection (see MAX_WILDCARD_EXPANSIONS): drop any
+        // completion above highfreq_cutoff for this field, sort the rest
+        // COMMONEST first, and take them until the completion cap or the
+        // posting-row budget is reached. Rarest-first (through 3.6) is why
+        // comp* found "compaan" but not "computer".
         //
-        // Earlier this just verified existence and returned all matches (no cap).
-        // Problem: "th*" returned 7,076 terms → 991K postings → 78s.
-        // Now: fetch doc_freq, sort ascending, cap at max_wildcard_expansions.
+        // Considered and dropped: also admitting the RAREST completions (a
+        // hybrid set, e.g. 100 commonest + 30 rarest per field) so Rarity could
+        // surface the tail. Measured on this corpus (2026-09-10): with no floor
+        // the 30 rare slots fill with identifiers and one-off strings (un2,
+        // un93, photo50, compactflah) and push out the 3-30-document topics; a
+        // floor of 3 documents plus a digit filter gives real words
+        // (unadilla, photobleaching); requiring the completion to be a title
+        // word gives real articles (Superactinide, Interlingua). But under
+        // summed IDF none of it reached Rarity's top 50, and under the
+        // rarest-completion rule (see scoreDoc) the common hundred already
+        // contain the tail for narrow prefixes (photo* has ~120 completions
+        // above three docs) and only add an arbitrary deeper tail for
+        // productive ones. The lever was scoring, not membership, so no knobs
+        // were added. A taxonomy or code-identifier corpus where the tail is
+        // the point would start here: rare slots with a floor and title filter.
         // (Per-field tables: termstats_<field> WHERE term IN (...) — no field
         // column needed. The earlier unified schema was
         // term_stats WHERE field = ? AND term IN (...).)
@@ -3687,21 +4161,38 @@ class Searcher
 
         if (empty($termsWithFreq)) return [];
 
-        // If within limit (or uncapped), return all — no sorting needed
-        if ($maxExpansions <= 0 || count($termsWithFreq) <= $maxExpansions) {
-            return array_keys($termsWithFreq);
+        // Per-field corpus cutoff: "united" is in 26% of body fields on the
+        // Wikipedia index (every US place and politician) but 13% of openings,
+        // so it is skipped in body and kept in opening. Same 100-document floor
+        // as the noise filter: on a 14-doc fixture 25% is 3 docs and the cutoff
+        // would remove the very completion the user meant.
+        $totalDocs = $this->fieldTotalDocs($field);
+        if ($hfCutoff < 1.0 && $totalDocs >= 100) {
+            $cut = (int)($totalDocs * $hfCutoff);
+            $termsWithFreq = array_filter($termsWithFreq, fn($df) => $df <= $cut);
+            if (empty($termsWithFreq)) return [];
         }
-
-        // Sort by doc_freq ascending (rarest first) and cap.
-        // Alphabetical secondary sort makes the cap boundary DETERMINISTIC.
-        // Earlier code (asort) left terms tied on doc_freq at the cutoff in fetch
-        // order, so which tied terms survived the cap was unspecified.
-        // Earlier:
-        // asort($termsWithFreq);
-        // return array_keys(array_slice($termsWithFreq, 0, self::MAX_WILDCARD_EXPANSIONS, true));
         $terms = array_keys($termsWithFreq);
-        usort($terms, fn($x, $y) => ($termsWithFreq[$x] <=> $termsWithFreq[$y]) ?: strcmp($x, $y));
-        return array_slice($terms, 0, $maxExpansions);
+        usort($terms, fn($x, $y) => ($termsWithFreq[$y] <=> $termsWithFreq[$x]) ?: strcmp($x, $y));
+        $out = []; $rows = 0;
+        foreach ($terms as $t) {
+            if ($maxExpansions > 0 && count($out) >= $maxExpansions) break;
+            if ($rowBudget > 0 && !empty($out) && $rows + $termsWithFreq[$t] > $rowBudget) break;
+            $out[] = $t;
+            $rows += $termsWithFreq[$t];
+        }
+        return $out;
+    }
+
+    /** total_docs for one field, from field_stats — static per index, cached per instance. */
+    private function fieldTotalDocs(string $field): int
+    {
+        if (!isset($this->fieldTotalDocsCache[$field])) {
+            $st = $this->db->prepare("SELECT total_docs FROM field_stats WHERE field = ?");
+            $st->execute([$field]);
+            $this->fieldTotalDocsCache[$field] = (int)$st->fetchColumn();
+        }
+        return $this->fieldTotalDocsCache[$field];
     }
 
     /**
@@ -3777,33 +4268,14 @@ class Searcher
     //
     // Benefits: eliminates field column overhead, no rowid lookups, smaller B-trees,
     // each field's data is physically contiguous for better cache locality.
-    private function fetchPostings(string $field, array $terms): array
-    {
-        if (empty($terms)) return [];
-        $table = "postings_$field";
-        $out = [];
-        foreach (array_chunk(array_values($terms), self::BATCH_SIZE) as $batch) {
-            $ph   = implode(',', array_fill(0, count($batch), '?'));
-            $stmt = $this->db->prepare(
-                "SELECT doc_id, term, freq FROM $table WHERE term IN ($ph)"
-            );
-            $stmt->execute($batch);
-            while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                $out[$row['doc_id']][$row['term']] = (int)$row['freq'];
-            }
-        }
-        return $out;
-    }
-
     /**
      * Fetch postings for specific terms AND specific doc_ids only.
      *
-     * Used in phase 2 of two-phase retrieval. After phase 1 identifies the top
-     * candidates using the light fields, this method fetches heavy-field
-     * postings ONLY for those surviving doc_ids.
-     *
-     * Plain fetchPostings('body', $terms) returns ALL docs matching any term
-     *   — for "solar" that's ~40K rows from body alone. Most are pruned away later.
+     * The ONLY way posting rows are materialized now: after the coverage
+     * prune, for the surviving candidates (see the candidate retrieval block
+     * in search()). A broad fetchPostings() used to load every doc matching
+     * any term — for "solar" ~40K rows from body alone, for a required "the"
+     * 270K — and most were pruned away unread.
      *
      * Here: filter by doc_id IN (...) at the SQL level, so SQLite only returns
      *   rows for the ~500 survivor docs. With PK(term, doc_id) in a WITHOUT ROWID table,
@@ -3813,22 +4285,49 @@ class Searcher
      * Since PK is (term, doc_id), SQLite seeks to each term, then binary-searches
      * within that term's range for matching doc_ids. Very efficient.
      */
-    private function fetchPostingsForDocs(string $field, array $terms, array $docIds): array
+    private function fetchPostingsForDocs(string $field, array $terms, array $docIds, int $rowsEstimate = 0): array
     {
         if (empty($terms) || empty($docIds)) return [];
-        $table = "postings_$field";
-        $out = [];
-        // Build doc_id placeholder once (reused across term batches)
-        $docPh = implode(',', array_fill(0, count($docIds), '?'));
-        foreach (array_chunk(array_values($terms), self::BATCH_SIZE) as $termBatch) {
+        $table  = "postings_$field";
+        $terms  = array_values(array_unique($terms));
+        $docIds = array_values($docIds);
+        $out    = [];
+
+        // Scan mode: when the terms' total postings are fewer than the
+        // (term, doc) pairs we would otherwise probe, range-scan the terms
+        // and filter doc ids in PHP. Rows are transient either way.
+        if ($rowsEstimate > 0 && count($docIds) * count($terms) * self::SEEK_COST_ROWS > $rowsEstimate) {
+            $want = array_fill_keys($docIds, true);
+            foreach (array_chunk($terms, self::BATCH_SIZE) as $batch) {
+                $ph   = implode(',', array_fill(0, count($batch), '?'));
+                $stmt = $this->db->prepare("SELECT doc_id, term, freq FROM $table WHERE term IN ($ph)");
+                $stmt->execute($batch);
+                while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
+                    if (!isset($want[$row[0]])) continue;
+                    $out[$row[0]][$row[1]] = (int)$row[2];
+                }
+            }
+            return $out;
+        }
+
+        // Seek mode, ids sorted so the probes walk the B-tree in order.
+        // Doc ids are chunked too: one IN list per statement used
+        // to hold every candidate, and SQLite caps bound variables at 32,766
+        // — exhaustive mode on a phrase (70K survivors) died with "too many
+        // SQL variables" here.
+        sort($docIds);
+        foreach (array_chunk($terms, self::BATCH_SIZE) as $termBatch) {
             $termPh = implode(',', array_fill(0, count($termBatch), '?'));
-            $stmt = $this->db->prepare(
-                "SELECT doc_id, term, freq FROM $table
-                 WHERE term IN ($termPh) AND doc_id IN ($docPh)"
-            );
-            $stmt->execute(array_merge($termBatch, $docIds));
-            while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                $out[$row['doc_id']][$row['term']] = (int)$row['freq'];
+            foreach (array_chunk($docIds, self::BATCH_SIZE) as $docBatch) {
+                $docPh = implode(',', array_fill(0, count($docBatch), '?'));
+                $stmt  = $this->db->prepare(
+                    "SELECT doc_id, term, freq FROM $table
+                     WHERE term IN ($termPh) AND doc_id IN ($docPh)"
+                );
+                $stmt->execute(array_merge($termBatch, $docBatch));
+                while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
+                    $out[$row[0]][$row[1]] = (int)$row[2];
+                }
             }
         }
         return $out;
@@ -3847,16 +4346,20 @@ class Searcher
         if (empty($terms) || empty($docIds)) return [];
         $table = "postings_$field";
         $out = [];
-        $docPh = implode(',', array_fill(0, count($docIds), '?'));
+        // Doc ids chunked like fetchPostingsForDocs (SQLite's 32,766
+        // bound-variable cap; exhaustive phrase queries exceed it).
         foreach (array_chunk(array_values($terms), self::BATCH_SIZE) as $termBatch) {
             $termPh = implode(',', array_fill(0, count($termBatch), '?'));
-            $stmt = $this->db->prepare(
-                "SELECT doc_id, term, pos FROM $table
-                 WHERE term IN ($termPh) AND doc_id IN ($docPh)"
-            );
-            $stmt->execute(array_merge($termBatch, $docIds));
-            while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                $out[$row['doc_id']][$row['term']] = self::decodePositions($row['pos']);
+            foreach (array_chunk(array_values($docIds), self::BATCH_SIZE) as $docBatch) {
+                $docPh = implode(',', array_fill(0, count($docBatch), '?'));
+                $stmt  = $this->db->prepare(
+                    "SELECT doc_id, term, pos FROM $table
+                     WHERE term IN ($termPh) AND doc_id IN ($docPh)"
+                );
+                $stmt->execute(array_merge($termBatch, $docBatch));
+                while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                    $out[$row['doc_id']][$row['term']] = self::decodePositions($row['pos']);
+                }
             }
         }
         return $out;

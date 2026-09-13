@@ -24,3 +24,16 @@ errors_httpd.log
 
 # PHP CLI error log (created next to scripts on fatal errors)
 error_log
+
+# Others
+CLAUDE.md
+.gitignore
+
+# Local scratch (sweep harness, results)
+tmp/
+errors_php.log
+docs/node_modules/
+docs/package-lock.json
+
+# Server-specific access rules (deploy-time, not part of the library)
+.htaccess

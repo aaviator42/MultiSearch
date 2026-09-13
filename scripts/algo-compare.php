@@ -1,6 +1,6 @@
 <?php
 /*
-scripts/algo-compare.php — "what does the engine produce?" — every algorithm
+algo-compare.php — "what does the engine produce?" — every algorithm
 side by side on a query, so a human can SEE where they agree and disagree.
 
 This is the exploration tool. The test suite answers "does it produce what I

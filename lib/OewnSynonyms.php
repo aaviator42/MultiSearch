@@ -154,13 +154,25 @@ class OewnSynonyms
      * Plain lookup words from a query string: strips the query-syntax
      * operators (+ - " * ^N) and bare numbers, so only dictionary-shaped
      * words are sent to WordNet.
+     *
+     * $skip (pass the app's stopword list) and $minLength keep function
+     * words and one/two-letter tokens out of the lookup. WordNet has
+     * synsets for them and they are useless as search expansions: "in" ->
+     * indium, "at" -> astatine, "i" -> iodine, "hun" -> kraut/boche/jerry
+     * (which pulled Tom and Jerry into a query about Attila — agent study,
+     * 2026-09-10). With stopword removal on the engine drops these words
+     * before synonyms apply, so this only bites when removal is off; it is
+     * still the right place to stop the lookup, since the app decides the
+     * list and the engine never sees WordNet.
      */
-    public static function queryWords(string $query): array
+    public static function queryWords(string $query, array $skip = [], int $minLength = 3): array
     {
         $q = strtolower($query);
         $q = preg_replace('/[+"*^]/', ' ', $q);
         $q = preg_replace('/-(?=[a-z])/', ' ', $q);
         $q = preg_replace('/\b\d+(\.\d+)?\b/', '', $q);
-        return array_values(array_filter(preg_split('/\s+/', trim($q))));
+        $skipSet = array_fill_keys($skip, true);
+        return array_values(array_filter(preg_split('/\s+/', trim($q)),
+            fn($w) => $w !== '' && mb_strlen($w) >= $minLength && !isset($skipSet[$w])));
     }
 }

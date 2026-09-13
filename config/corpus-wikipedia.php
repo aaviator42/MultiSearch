@@ -33,14 +33,15 @@ return [
 	'db'      => __DIR__ . '/../data/wikipedia.db',
 	'oewn_db' => __DIR__ . '/../data/oewn.db',
 	// Stopword list. The repo ships config/stopwords.json by default — a
-	// hand-curated English list of 118 words — and the demo UI loads it
-	// lazily, only when "remove stopwords" is ticked. Point this at your own
-	// JSON array of words for another corpus or language, or drop the key
-	// (or the file) for no stopword removal at all: the engine itself ships
-	// no list, and BM25's IDF plus the high-frequency cutoff already
-	// suppress common words. It lives in config/, not data/, because it is
-	// hand-curated source, not a build artifact; corpus-specific on purpose,
-	// since an English list belongs to an English corpus.
+	// hand-curated English list of 118 words. The demo UI ticks "remove
+	// stopwords" by default (measured: question queries 0.60 -> 0.93 MRR)
+	// and also uses the list to keep function words out of the WordNet
+	// lookup. Point this at your own JSON array of words for another corpus
+	// or language, or drop the key (or the file) for no stopword removal at
+	// all: the engine itself ships no list. It lives in config/, not data/,
+	// because it is hand-curated source, not a build artifact;
+	// corpus-specific on purpose, since an English list belongs to an
+	// English corpus.
 	'stopwords' => __DIR__ . '/stopwords.json',
 
 	// Corpus profile — what's special about THIS corpus. The library assumes

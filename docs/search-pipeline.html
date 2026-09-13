@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MultiSearch — one search() call</title>
+<!--
+  docs/search-pipeline.html — the MultiSearch pipeline diagram as plain HTML + CSS.
+
+  Replaces the Graphviz versions (search-pipeline*.dot). Those needed fixed
+  node sizes for equal heights, an SVG post-process to align the strip's left
+  edge, pin edges to keep the example text under its stage, and finally
+  broke the arrows once ports were involved. Here every alignment is a grid
+  column: the example line is in the same cell as its box, panels share one
+  width, rows start at the same x.
+
+  Screenshot (PNG for the README) from WSL, Windows Chrome/Edge headless:
+    "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" --headless
+      --screenshot="C:\...\docs\search-pipeline.png" --window-size=2104,960
+      --hide-scrollbars "file:///C:/.../docs/search-pipeline.html"
+  Numbers are measurements on the Simple English Wikipedia index (282,905
+  articles); thresholds are library defaults. Engine 3.7.
+-->
+<style>
+  :root {
+    --ink: #222; --muted: #555; --frame: #c9c9c9; --card: #8a8a8a; --green: #2e5c2e;
+    --c1: #eeeeee; --c2: #e3ecf7; --c3: #fff3d6; --c4: #e4f3e6; --c5: #e4f3e6; --c6: #fbe6d6; --c7: #efe3f5;
+    --f1: #f7f7f7; --f2: #f3f6fb; --f3: #fdf8ee; --f4: #f1f8f2; --f5: #f1f8f2; --f6: #fdf3ec; --f7: #f6f0f9;
+    --panel-w: 400px; --gap: 16px; --stage-w: 200px; --arrow-w: 74px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: #fff; color: var(--ink);
+         font: 12px/1.35 Helvetica, Arial, "Liberation Sans", sans-serif; width: max-content; }
+  b { font-weight: 700; }
+  .frame { border: 1px solid var(--frame); border-radius: 12px; padding: 10px 12px 12px; margin-bottom: var(--gap); }
+  .frame > h2 { margin: 0 0 10px; font-size: 13px; font-weight: 400; }
+  .frame > h2 b { font-size: 13px; }
+
+  /* ── overview strip ─────────────────────────────────────────────── */
+  .overview { background: #fcfcfc; width: max-content; }
+  .stages { display: grid; align-items: start;
+            grid-template-columns: repeat(6, var(--stage-w) var(--arrow-w)) var(--stage-w); }
+  .stage .box { height: 68px; border: 1px solid var(--card); border-radius: 10px; display: flex; flex-direction: column;
+                justify-content: center; align-items: center; text-align: center; padding: 0 6px; }
+  .stage .box b { display: block; }
+  .stage .ex { margin-top: 12px; color: var(--green); font-size: 10.5px; line-height: 1.3; text-align: center; }
+  .arrow { position: relative; height: 68px; }
+  .arrow .lbl { position: absolute; left: 0; right: 0; top: 4px; text-align: center; color: var(--muted); font-size: 9.5px; line-height: 1.15; }
+  .arrow svg { position: absolute; left: 0; top: 33px; width: 100%; height: 10px; overflow: visible; }
+  .arrow line { stroke: #333; stroke-width: 1.6; }
+  .arrow polygon { fill: #333; }
+
+  /* ── detail panels ──────────────────────────────────────────────── */
+  .row { display: grid; gap: var(--gap); width: max-content; margin-bottom: var(--gap); }
+  .row.four { grid-template-columns: repeat(4, var(--panel-w)); }
+  .row.five { grid-template-columns: repeat(5, var(--panel-w)); }
+  .panel { width: var(--panel-w); border: 1px solid var(--frame); border-radius: 12px; padding: 8px 12px 12px;
+           display: flex; flex-direction: column; }   /* card fills the frame, so cards in a row are equal */
+  .panel h3 { margin: 0 0 8px; font-size: 12px; font-weight: 400; }
+  .panel h3 b { font-size: 12px; }
+  .card { background: #fff; border: 1px solid var(--card); border-radius: 10px; padding: 9px 11px; flex: 1; }
+  .card p { margin: 0; white-space: nowrap; }
+  .card p.i  { padding-left: 14px; }
+  .card p.ii { padding-left: 28px; }
+  .card p.gap { height: 6px; }
+  .sq { color: var(--green); }
+  .legend .card { border-color: #cccccc; }
+  .legend .card p { white-space: normal; }
+
+  table.route { border-collapse: separate; border-spacing: 2px; margin: 4px 0 6px -2px; }
+  table.route td { border: 1px solid #cccccc; padding: 2px 6px; white-space: nowrap; }
+  table.route tr.hdr td { border: 0; font-style: italic; color: var(--muted); padding: 0 6px; }
+  table.route td.algo { text-align: center; }
+</style>
+</head>
+<body>
+
+<!-- ── Overview strip ─────────────────────────────────────────────── -->
+<section class="frame overview">
+  <h2><b>One search() call</b> — the shape of the pipeline, with the example query <i>einstien "solar systems" -moon</i> traced underneath in green</h2>
+  <div class="stages">
+    <div class="stage"><div class="box" style="background:var(--c1)"><b>1 · Parse</b>operators · words · phrases · shape</div>
+      <div class="ex">einstien · solar · systems · −moon<br>phrase [solar systems] · shape: plain<br>auto: decide after fuzzy (stage 2)</div></div>
+    <div class="arrow"><span class="lbl">typed words<br>+ operators</span><svg viewBox="0 0 74 10" preserveAspectRatio="none"><line x1="0" y1="5" x2="64" y2="5"/><polygon points="63,0 74,5 63,10"/></svg></div>
+
+    <div class="stage"><div class="box" style="background:var(--c2)"><b>2 · Expand</b>stems · WordNet · fuzzy</div>
+      <div class="ex">einstien → einstein (2 vs 414 docs)<br>+ einsten · system · 4 morph forms<br>typo evidence → freq</div></div>
+    <div class="arrow"><span class="lbl">terms, each with<br>origin + boost</span><svg viewBox="0 0 74 10" preserveAspectRatio="none"><line x1="0" y1="5" x2="64" y2="5"/><polygon points="63,0 74,5 63,10"/></svg></div>
+
+    <div class="stage"><div class="box" style="background:var(--c3)"><b>3 · Weigh</b>df / IDF · noise cut</div>
+      <div class="ex">df + IDF per field, 12 terms<br>none dropped as noise</div></div>
+    <div class="arrow"><span class="lbl">kept terms<br>+ df / IDF</span><svg viewBox="0 0 74 10" preserveAspectRatio="none"><line x1="0" y1="5" x2="64" y2="5"/><polygon points="63,0 74,5 63,10"/></svg></div>
+
+    <div class="stage"><div class="box" style="background:var(--c4)"><b>4 · Retrieve</b>one bitmask per document</div>
+      <div class="ex">anchor: solar, 2,012 docs<br>∩ systems|system → 752 candidates</div></div>
+    <div class="arrow"><span class="lbl">candidates +<br>coverage bits</span><svg viewBox="0 0 74 10" preserveAspectRatio="none"><line x1="0" y1="5" x2="64" y2="5"/><polygon points="63,0 74,5 63,10"/></svg></div>
+
+    <div class="stage"><div class="box" style="background:var(--c5)"><b>5 · Prune + fetch</b>postings for survivors only</div>
+      <div class="ex">752 ≤ 5,000: all kept<br>rows + positions for 752 docs<br>moon fetched for them only</div></div>
+    <div class="arrow"><span class="lbl">survivors +<br>posting rows</span><svg viewBox="0 0 74 10" preserveAspectRatio="none"><line x1="0" y1="5" x2="64" y2="5"/><polygon points="63,0 74,5 63,10"/></svg></div>
+
+    <div class="stage"><div class="box" style="background:var(--c6)"><b>6 · Score</b>filters · algorithm · bonuses</div>
+      <div class="ex">27 pass: phrase adjacent, no moon<br>freq per field · title bonus</div></div>
+    <div class="arrow"><span class="lbl">scored docs</span><svg viewBox="0 0 74 10" preserveAspectRatio="none"><line x1="0" y1="5" x2="64" y2="5"/><polygon points="63,0 74,5 63,10"/></svg></div>
+
+    <div class="stage"><div class="box" style="background:var(--c7)"><b>7 · Present</b>normalize · page · snippets</div>
+      <div class="ex">page 1 of 27<br>0.12 s · 4 MB peak</div></div>
+  </div>
+</section>
+
+<!-- ── Detail panels, row 1 (stages 1-4) ──────────────────────────── -->
+<div class="row four">
+  <section class="panel" style="background:var(--f1)">
+    <h3><b>1 · Parse</b> — parseQuery()</h3>
+    <div class="card">
+      <p><b>Tokenize</b> like the index, so query and document never</p>
+      <p class="i">disagree on what a word is: lowercase · don't → dont ·</p>
+      <p class="i">coca-cola → coca cola · café → cafe [fold_diacritics]</p>
+      <p class="i">a corpus can swap in its own [term_normalizer]</p>
+      <p><b>"quoted words"</b> → phrase: all words required, adjacency</p>
+      <p class="i">checked in stage 6 on a positional index [phrase_mode]</p>
+      <p><b>+word / -word</b> → required / excluded (also <b>-"phrase"</b>)</p>
+      <p><b>word*</b> → prefix; <i>object-orient*</i> = object + orient*</p>
+      <p><b>word^2</b> → boost, on any of the above</p>
+      <p><b>Numbers</b> digits joined by . : / - are one unit, searched as</p>
+      <p class="i">an adjacent phrase of the parts [compound_numbers]</p>
+      <p class="i">3.14 · 10:30 · 2024-05-01 · 192.168.0.1 · 1/2 (−3.14 excludes)</p>
+      <p class="i">v2.0, f-16 and roman numerals stay ordinary words</p>
+      <p><b>Digits are exact</b> a token with a digit is never fuzzed (co2, 1998)</p>
+      <p><b>Query shape</b> noted for the auto algo (routing table below):</p>
+      <p class="i">has a wildcard · has a question word (who, what, when…) ·</p>
+      <p class="i">is a single word (excluded words don't count)</p>
+    </div>
+  </section>
+
+  <section class="panel" style="background:var(--f2)">
+    <h3><b>2 · Expand</b> — variants remember origin, class, boost</h3>
+    <div class="card">
+      <p><b>Stopwords</b> removed from optional words if a list is passed</p>
+      <p class="i">(demo default: on — questions 0.60 → 0.93 MRR)</p>
+      <p><b>Stems</b> rule-based, both directions · 0.8× [stem_boost]</p>
+      <p class="i">required words: OR-group (systems | system)</p>
+      <p class="i">risky rules only if WordNet verifies · 0.7×</p>
+      <p><b>WordNet</b> synonyms + derivations, optional words only</p>
+      <p class="i">stopwords and 1-2 letter words never looked up</p>
+      <p class="i">an excluded word is never re-added</p>
+      <p><b>Morph</b> +suffixes, kept if the form exists · 0.7 [morph_boost]</p>
+      <p><b>Fuzzy</b> typed optional words only · 0.5^edits [fuzzy_decay]</p>
+      <p class="i">max 10 per word · same first letter · edit budget from</p>
+      <p class="i">length × (100 − confidence)</p>
+      <p><b>Typo swap</b> einstien (2 docs) vs einstein (300+) → swap</p>
+      <p class="i">[typo_swap_ratio 10×] unless other query words vouch</p>
+      <p class="i">for the typed one [swap_context_check]</p>
+      <p><b>Typo evidence</b> for auto: a swap fired, or a typed word</p>
+      <p class="i">is in no document at all</p>
+      <p>Required, quoted and excluded words: stems only, never fuzzy</p>
+    </div>
+  </section>
+
+  <section class="panel" style="background:var(--f3)">
+    <h3><b>3 · Weigh</b> — how rare is each term, which are noise</h3>
+    <div class="card">
+      <p><b>Term stats</b> <span class="sq">[SQLite]</span> df + precomputed IDF per field</p>
+      <p class="i">for every term, excluded words included</p>
+      <p><b>Corpus stopwords</b> optional term in &gt; 25% of docs → dropped</p>
+      <p class="i">[highfreq_cutoff] ("united" is in 26% of bodies)</p>
+      <p><b>Fuzzy noise</b> variant &gt; max(1000, 3× origin df) → dropped</p>
+      <p class="i">("start" is not a match for "smart")</p>
+      <p><b>Wildcards</b> <span class="sq">[SQLite]</span> per field: commonest completions</p>
+      <p class="i">under the cutoff, up to 100 or 200K rows</p>
+      <p class="i">[max_wildcard_expansions] [wildcard_row_budget]</p>
+      <p class="i">completions are exempt from the noise cut</p>
+      <p class="i">(rarest-first, through 3.6: comp* never found computer)</p>
+      <p><b>-word*</b> → doc-id set built in SQL, no rows loaded</p>
+    </div>
+  </section>
+
+  <section class="panel" style="background:var(--f4)">
+    <h3><b>4 · Retrieve</b> — memory ∝ matched docs, not posting rows</h3>
+    <div class="card">
+      <p><b>Coverage bitmask</b> one bit per original word</p>
+      <p class="i">solar=1 · systems=2 · einstien=4 · prefix = one bit</p>
+      <p class="i">variants set their origin's bit · one int (~40 B) per doc</p>
+      <p><b>Required words</b> intersect, rarest first <span class="sq">[SQLite]</span></p>
+      <p class="i">stream the rarest (solar: 2,012 docs), then look each</p>
+      <p class="i">next word up for the survivors only → 752</p>
+      <p class="i">"the" is looked up for thousands of docs, never 270K</p>
+      <p><b>Is the rarest required word in ≤ 25% of docs?</b></p>
+      <p class="i"><b>yes</b> → anchor on it; the set only shrinks [highfreq_cutoff]</p>
+      <p class="i"><b>no</b> ("of the") → seed from the optional words, verify</p>
+      <p class="ii">every required word on the seed, top up with a capped</p>
+      <p class="ii">sample [broad_cap] → flagged <i>truncated</i> in diag</p>
+      <p><b>Optional words</b> <span class="sq">[SQLite]</span> set bits; limited to the</p>
+      <p class="i">survivors when required words exist</p>
+    </div>
+  </section>
+</div>
+
+<!-- ── Detail panels, row 2 (stages 5-7, routing table, legend) ────── -->
+<div class="row five">
+  <section class="panel" style="background:var(--f5)">
+    <h3><b>5 · Prune + fetch</b></h3>
+    <div class="card">
+      <p><b>Prune</b> more than 5,000 candidates? [candidate_limit]</p>
+      <p class="i">yes → keep the 5,000 with the most bits set;</p>
+      <p class="i">ties keep stream order (title-field matches first)</p>
+      <p class="i">no → keep all · exhaustive mode (limit 0) always keeps all</p>
+      <p><b>Two-phase</b> [two_phase] collect candidates from the light</p>
+      <p class="i">fields only, prune to [phase1_limit], then fetch all fields</p>
+      <p><b>Postings</b> <span class="sq">[SQLite]</span> [field][doc][term] = tf, every field,</p>
+      <p class="i">for the survivors only: required + optional + excluded</p>
+      <p class="i">seek each (term, doc) pair by primary key, ids sorted,</p>
+      <p class="i">≤ 900 per statement · or range-scan the terms and filter</p>
+      <p class="i">in PHP when their rows &lt; 6 × the pairs — cheaper wins</p>
+      <p class="i">excluded words (moon) are read here for the first time:</p>
+      <p class="i">exclusion happens after the prune, so earlier was waste</p>
+      <p><b>Positions</b> <span class="sq">[SQLite]</span> phrase words only (solar, systems),</p>
+      <p class="i">same docs · delta-coded blobs, decoded per doc</p>
+      <p><b>Doc lengths</b> <span class="sq">[SQLite]</span> one batched read · BM25 family and</p>
+      <p class="i">DFR use them; so do the title bonus and the tiebreaker</p>
+    </div>
+  </section>
+
+  <section class="panel" style="background:var(--f6)">
+    <h3><b>6 · Score</b> — work ∝ survivors × terms</h3>
+    <div class="card">
+      <p><b>Filter</b> every required group present · no excluded word</p>
+      <p class="i">· phrase adjacent on the literal typed words → 27 docs</p>
+      <p class="i">(no positions in the index → all phrase words in one field)</p>
+      <p><b>Score per field</b> × field weight [title 3 · opening 2 · body 1]</p>
+      <p class="i">bm25 · bm25+cov · bm25f · dfr · cover · idf · freq · rrf</p>
+      <p class="i">term weight = IDF × trust boost: a variant adds recall</p>
+      <p class="i">but never outranks the exact word</p>
+      <p><b>Coverage</b> counts concepts: all forms of a word = one slot</p>
+      <p><b>Rarity</b> credits a prefix with its rarest matched completion</p>
+      <p class="i">(photo* → photobleaching, not photography)</p>
+      <p><b>Adjust</b> proximity boost (BM25 family, DFR) · title bonus</p>
+      <p class="i">full / half / partial by how much of the title the query covers</p>
+      <p class="i">[title_bonus_*] · rrf: fuse bm25 + coverage ranks</p>
+    </div>
+  </section>
+
+  <section class="panel" style="background:var(--f7)">
+    <h3><b>7 · Present</b></h3>
+    <div class="card">
+      <p><b>Normalize</b> best document = 100, the rest relative to it;</p>
+      <p class="i">order untouched, scores comparable across algorithms</p>
+      <p class="i">(raw bm25 5-70, coverage 0-100, rrf 0.01-0.1)</p>
+      <p><b>Sort</b> score ↓ · then shorter title (token count): "Water"</p>
+      <p class="i">before "Water pollution" · then doc id, so ties are stable</p>
+      <p><b>Total</b> = docs with score &gt; 0 · <b>page</b> = one slice of them</p>
+      <p><b>Titles + snippets</b> <span class="sq">[SQLite]</span> for the page only, from the</p>
+      <p class="i">optional documents table (absent → doc id as title)</p>
+      <p class="i">snippet = opening cut at 300 chars [snippet_length],</p>
+      <p class="i">escaped, then each word tokenized like the query and</p>
+      <p class="i">&lt;mark&gt;ed when it is a matched term</p>
+      <p><b>Return</b> hits {score, title, field_scores, matches, snippet}</p>
+      <p class="i">· total · pages · the resolved algo (auto's pick)</p>
+      <p><b>diag</b> (opt-in) parsed query · expansions with origin, class,</p>
+      <p class="i">boost · swaps · dropped · candidates {matched, scored,</p>
+      <p class="i">truncated, passed_filters} · auto's typo evidence</p>
+    </div>
+  </section>
+
+  <section class="panel" style="background:var(--f1)">
+    <h3><b>auto algo</b> — the configured routing table for this corpus</h3>
+    <div class="card">
+      <p><b>Route (auto)</b> — first rule that matches wins</p>
+      <table class="route">
+        <tr class="hdr"><td>query shape</td><td>algo</td><td>knob</td></tr>
+        <tr><td>wildcard</td><td class="algo">freq</td><td>[auto_wildcard_algo]</td></tr>
+        <tr><td>typo evidence (fuzzy on)</td><td class="algo">freq</td><td>[auto_typo_algo]</td></tr>
+        <tr><td>question word</td><td class="algo">freq</td><td>[auto_question_algo]</td></tr>
+        <tr><td>one typed word</td><td class="algo">freq</td><td>[auto_single_word_algo]</td></tr>
+        <tr><td>everything else</td><td class="algo">cover</td><td>[auto_default_algo]</td></tr>
+      </table>
+      <p>Rows 1, 3 and 4 are visible in the typed query (stage 1).</p>
+      <p>Typo evidence — a typed word in no document, or fuzzy</p>
+      <p>found a far commoner spelling — exists only after stage 2,</p>
+      <p>so with fuzzy on the pick waits for it; otherwise the shape</p>
+      <p>rule applies. Each row is a knob a corpus profile can change.</p>
+    </div>
+  </section>
+
+  <section class="panel legend" style="background:#fff; border-color:#fff">
+    <h3>&nbsp;</h3>
+    <div class="card">
+      <p><b>Legend</b></p>
+      <p><span class="sq">[SQLite]</span> = a query against the index</p>
+      <p>[name] = a knob (corpus profile or per search)</p>
+      <p class="gap"></p>
+      <p><b>Note</b></p>
+      <p>Thresholds are library defaults, tuned on Simple English Wikipedia (282,905 articles); other numbers are measurements on that index. The green track is a real run of the example query.</p>
+    </div>
+  </section>
+</div>
+
+</body>
+</html>

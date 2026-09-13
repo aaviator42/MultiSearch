@@ -1,7 +1,10 @@
 <?php
 /*
-scripts/build-index.php — Build data/wikipedia.db from the Simple English
-Wikipedia CirrusSearch dump, in one pass.
+scripts/build-index.php
+MultiSearch inverted index builder
+
+This script builds data/wikipedia.db from the Simple English Wikipedia 
+CirrusSearch dump, in one pass.
 
 Run:  php scripts/build-index.php                 (positional index, default)
       php scripts/build-index.php --no-positions  (smaller, no phrase adjacency)
@@ -10,18 +13,40 @@ Run:  php scripts/build-index.php                 (positional index, default)
       php scripts/build-index.php --no-fold       (keep diacritics —
                  café and cafe stay separate terms; see FOLD_DIACRITICS)
 
-This script is a thin driver around Builder::bulkBuild(). An earlier version
-carried its own copy of the engine's schema DDL and the IDF/stats SQL — the
-bulk strategy (staging tables + sorted insert) was the script's real value,
-but the schema and stats were duplicated from lib/MultiBuilder.php with
-nothing enforcing agreement, the same private-copy drift that once let the
-build-time and query-time tokenizers disagree (see the tokenization contract
-in lib/MultiSearch.php). The strategy moved into the library; what's left
-here is everything Wikipedia-specific: opening the bz2 dump (with
-decompressor fallbacks), walking the NDJSON, choosing page_id as the key,
-skipping non-article namespaces and redirects, and the provenance rows.
+This script is a thin driver around Builder::bulkBuild(). Code in this script
+is specific to the Wikipedia corpus, and users are expected to modify it to fit
+their needs. 
 
-── What goes into the index ──────────────────────────────────────────────────
+Adapting it to another corpus:
+  - Replace the $articles generator: it must yield:
+      [doc_id, ['field' => text, ...]]                  // without display data, or
+      [doc_id, ['field' => text, ...], title, opening]  // with display data
+    One entry per document. Field names are yours; the searcher's field
+    weights (config/corpus-wikipedia.php) must use the same names.
+  - title and opening are optional display data (result titles and snippets),
+    not searched. To search titles and snippets, include them in the fields array, 
+    as this script does.
+  - doc_id: any stable key. Integers are compact ('doc_id_type' => 'INTEGER');
+    switch to 'TEXT' for string keys. We never derive anything from it in ranking.
+  - Replace the dump-opening code above the generator with whatever reads your
+    source (files, a database cursor, an API page loop). Anything iterable works.
+  - Keep tokenization to the library: bulkBuild() uses Searcher::tokenize(),
+    so build and query can never disagree.
+  - 'meta' is free-form provenance stored in the index (source, date, notes).
+
+When to use this script vs the incremental Builder API
+  - Use bulkBuild() (via this or similar script) for a full build from scratch: 
+    it stages postings unindexed, then inserts them sorted, about 10x faster than
+    per-document inserts on a corpus this size. It cannot update an index.
+  - Use new Builder(...)->addText() / addDocument() / removeDocument() when
+    documents change one at a time or the index must stay online while it is
+    updated (WAL mode; a searcher can read during writes). Call rebuildStats()
+    after a batch of changes.
+  - Rebuilding from scratch with this script is also the way to change a
+    build-time decision: positions, diacritic folding, doc id type, field set.
+
+
+── What goes into the wikipedia index ──────────────────────────────────────────────────
   Fields:  title, opening (opening_text, or the first 200 chars of text),
            body (full text). Weights are the Searcher's business, not ours
            (config/corpus-wikipedia.php).
@@ -41,7 +66,7 @@ skipping non-article namespaces and redirects, and the provenance rows.
            (bulkBuild dedupes too; a duplicated article must not double its
            postings).
 
-── Build strategy (now in Builder::bulkBuild) ────────────────────────────────
+── Build strategy (Builder::bulkBuild) ────────────────────────────────
   Stage 1: stream, tokenize (Searcher::tokenize — build and query share ONE
            implementation), append postings to unindexed staging tables.
   Stage 2: INSERT INTO postings_<f> ... SELECT ... ORDER BY term, doc_id — a

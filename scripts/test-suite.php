@@ -1,6 +1,9 @@
 <?php
 /*
-scripts/test-suite.php — Comprehensive search engine test suite.
+
+Comprehensive test suite for MultiSearch.
+by @aaviator42
+AGPLv3
 
 Tests all algorithms, all features, ranking quality, fuzzy discounting, and
 performance across the full matrix. Saves results to data/test-results/ as
@@ -18,16 +21,6 @@ Run:  php scripts/test-suite.php
       php scripts/test-suite.php --rk='{"k1":1.2}' --label=k1-1.2 --save
                                                 (whole suite under knob overrides;
                                                  compare runs with compare-configs.php)
-
-── History ────────────────────────────────────────────────────────────────────
-  The suite was created to track ranking changes while iterating on fuzzy
-  discounting. The "value vs valve" problem (a fuzzy match outranking the
-  typed term under BM25) was the motivation: a distance-based boost
-  (pow(confidence/100, distance)) fixed it for coverage but BM25 still had
-  issues, so the suite captures the full picture across all algorithms to
-  diagnose. It has since grown into the regression gate for every engine
-  change: declarative assertions, performance budgets, positional and
-  diacritic-folding semantics, and the labeled ranking study.
 */
 
 ini_set('memory_limit', '512M');
@@ -118,10 +111,6 @@ foreach ($argv ?? [] as $arg) {
 // ═════════════════════════════════════════════════════════════════════════════
 // OEWN synonyms
 // ═════════════════════════════════════════════════════════════════════════════
-// This file used to carry ~55 lines copy-pasted verbatim from index.php
-// (oewnReady / getOewnSynonyms / queryWords — the header here even confessed
-// "mirrors index.php"), so every synonym fix had to be made twice. Both now
-// use lib/OewnSynonyms.php.
 
 $oewn = new \MultiSearch\OewnSynonyms(OEWN_DB_PATH);
 
@@ -263,6 +252,40 @@ $fuzzyTests = [
 	 'query' => 'smart', 'confidence' => 85,
 	 'expect_top' => 'Smart',
 	 'note' => 'Exact term should outrank fuzzy matches due to distance-based boost'],
+
+	// Numbers are exact. Every term gets an edit budget of at least one, so
+	// "1" used to expand to 10..19 (ten of the commonest tokens in the corpus,
+	// 443K posting rows) and the noise filter could not catch it because "1"
+	// itself is in 66K documents.
+	['id' => 'fuzzy-numeric-exact',
+	 'query' => '19', 'confidence' => 85, 'algo' => 'auto',
+	 'expect_diag' => ['query.numeric_exact' => ['19']], 'max_mem_mb' => 60,
+	 'note' => '"19" is not a typo of "1": no fuzzy variants for numeric words'],
+	['id' => 'fuzzy-alphanumeric-exact',
+	 'query' => 'co2 emissions', 'confidence' => 85, 'algo' => 'auto', 'stemming' => true,
+	 'expect_diag' => ['query.numeric_exact' => ['co2']], 'expect_in_top' => ['Carbon dioxide', 'Greenhouse gas', 'Carbon dioxide in Earth\'s atmosphere', 'Greenhouse effect'], 'top_n' => 5,
+	 'note' => 'Codes and formulas are exact: co2 used to fuzz to cod/cob (agent study)'],
+	['id' => 'fuzzy-numeric-year',
+	 'query' => '1998', 'confidence' => 85, 'algo' => 'auto',
+	 'expect_min' => 5000, 'expect_diag' => ['query.numeric_exact' => ['1998']],
+	 'note' => 'Years match exactly'],
+
+	// Words starting with a zero. PHP treats the string "0" as false, so a
+	// bare array_filter() in the expander's first-character bucket and in
+	// parseQuery's cleanup dropped them: "000" found 196 of 14,509 documents,
+	// "007" found 1, and the query "0" parsed to nothing.
+	['id' => 'fuzzy-zero-prefix-word',
+	 'query' => '000', 'confidence' => 85, 'algo' => 'auto',
+	 'expect_min' => 5000,
+	 'note' => 'Zero-prefixed word survives fuzzy expansion'],
+	['id' => 'fuzzy-zero-prefix-bond',
+	 'query' => '007', 'confidence' => 85, 'algo' => 'auto',
+	 'expect_min' => 200,
+	 'note' => 'Same bucket bug, on a word people actually search for'],
+	['id' => 'fuzzy-bare-zero',
+	 'query' => '0', 'confidence' => 85, 'algo' => 'auto',
+	 'expect_min' => 5000,
+	 'note' => 'The query "0" is a query'],
 ];
 
 foreach ($fuzzyTests as $ft) {
@@ -288,6 +311,33 @@ $routingTests = [
 	 'query' => 'einstien', 'confidence' => 85, 'algo' => 'auto',
 	 'expect_algo' => 'freq',
 	 'note' => 'Single-word corpus typo: swaps under every config -> freq'],
+
+	// Single typed words route to freq: under cover every match ties and the
+	// title tiebreak picks the shortest title (the Beethoven film, Leopold
+	// Mozart). Measured on 89 labelled queries: clean names .79 (freq) vs
+	// .66 (cover). Questions route to freq too: .925 vs bm25f .847 with the
+	// stopword list on, and bm25f was the slow path.
+	['id' => 'route-single-word-freq',
+	 'query' => 'beethoven', 'confidence' => 100, 'algo' => 'auto', 'stemming' => true,
+	 'expect_algo' => 'freq', 'expect_in_top' => ['Ludwig van Beethoven'], 'top_n' => 3,
+	 'note' => 'One typed word -> freq; the composer, not the film, in the top 3'],
+	['id' => 'route-single-word-excluded',
+	 'query' => 'python -snake', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_algo' => 'freq', 'expect_in_top' => ['Python (programming language)'], 'top_n' => 3,
+	 'note' => 'An excluded word adds no ranking signal, so this is still a single-word query'],
+	['id' => 'route-question-freq',
+	 'query' => 'how does the heart work', 'confidence' => 85, 'algo' => 'auto', 'stemming' => true, 'stopwords' => true,
+	 'expect_algo' => 'freq', 'expect_top' => 'Heart',
+	 'note' => 'Question word -> freq; with the stopword list on the answer is first'],
+	['id' => 'route-multi-word-cover',
+	 'query' => 'solar system planets', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_algo' => 'cover',
+	 'note' => 'Several plain words, no question word: the default stays cover'],
+	['id' => 'route-knob-override',
+	 'query' => 'albert einstein', 'confidence' => 100, 'algo' => 'auto',
+	 'opts' => ['ranking' => ['auto_default_algo' => 'bm25f']],
+	 'expect_algo' => 'bm25f', 'expect_top' => 'Albert Einstein',
+	 'note' => 'The routing table is a ranking knob'],
 ];
 foreach ($routingTests as $rt) {
 	$rt['group'] = 'routing';
@@ -336,10 +386,138 @@ $syntaxTests = [
 	 'query' => '+quantum +tunnel', 'confidence' => 100,
 	 'expect_min' => 1,
 	 'note' => 'Both terms required narrows results'],
+
+	// Required words resolve by intersecting from the rarest one, and only
+	// when every required word is common does the engine seed from the
+	// optional words and top up with a capped sample (diag flags it).
+	['id' => 'syntax-required-common-word',
+	 'query' => 'beethoven +the', 'confidence' => 100, 'algo' => 'auto', 'stemming' => true,
+	 'expect_in_top' => ['Ludwig van Beethoven'], 'top_n' => 5, 'max_mem_mb' => 60,
+	 'expect_diag' => ['candidates.truncated' => true],
+	 'note' => 'Common required word: candidates seeded from "beethoven", +the verified on them, sample flagged'],
+	['id' => 'syntax-required-rare-plus-common',
+	 'query' => '+beethoven the', 'confidence' => 100, 'algo' => 'auto', 'stemming' => true,
+	 'expect_min' => 300,
+	 'note' => 'Rare required word anchors; used to return 75 because title-field "the" docs filled the candidate cap first'],
+	['id' => 'syntax-required-not-sampled',
+	 'query' => 'einstein', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_diag' => ['candidates.truncated' => false],
+	 'note' => 'An ordinary query is never flagged as sampled'],
+	['id' => 'syntax-phrase-all-stopwords',
+	 'query' => '"of the"', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_min' => 1000, 'max_mem_mb' => 90, 'max_time' => 4.0,
+	 'expect_diag' => ['candidates.truncated' => true],
+	 'note' => 'Phrase of common words: a capped, flagged sample rather than every document'],
+
+	// Exclusion only ever needs the surviving candidates, so an excluded word
+	// is fetched for those and never widens the candidate pool.
+	['id' => 'syntax-excluded-stopword',
+	 'query' => 'solar -the', 'confidence' => 100, 'algo' => 'auto', 'stemming' => true,
+	 'expect_min' => 2, 'expect_max' => 40, 'max_mem_mb' => 40,
+	 'note' => 'Only the few solar docs without "the" remain; the full fetch of "the" used to cost 300 MB'],
+	['id' => 'syntax-excluded-many-stopwords',
+	 'query' => 'einstein -a -the -of', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_max' => 20, 'max_mem_mb' => 40,
+	 'note' => 'Every Einstein page has a/the/of, so ~0 hits is right; the assertion is the memory'],
+
+	// A single quoted word is exactly that word: morph variants may re-rank
+	// results but never admit a document (4,709 contain the literal "think").
+	['id' => 'syntax-quoted-word-exact-set',
+	 'query' => '"think"', 'confidence' => 85, 'algo' => 'auto', 'stemming' => true,
+	 'expect_min' => 4700, 'expect_max' => 4720,
+	 'note' => 'Quoted single word: result set is the literal word'],
+
+	// Wildcards expand to the COMMONEST completions under the frequency
+	// cutoff. The first design took the rarest ones on the argument that
+	// rare terms are most discriminative, which confused how a completion
+	// should be weighted with whether it should be included: comp* matched
+	// compaan and companeez and never computer or company, un* returned
+	// David Unaipon. A 24-query study found 19 of 47 intended completions
+	// under rarest-first and 46 under commonest-first.
+	['id' => 'syntax-wildcard-commonest',
+	 'query' => 'comp*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['Computer', 'Quantum computer', 'Cloud computing', 'Computer science'], 'top_n' => 10,
+	 'expect_min' => 4000, 'expect_diag' => ['candidates.scored' => 5000],
+	 'note' => 'comp* reaches computer; the prefix counts as one coverage concept so the query prunes like any other'],
+	['id' => 'syntax-wildcard-united',
+	 'query' => 'un*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['United States'], 'top_n' => 5,
+	 'note' => 'un* reaches united (kept in opening; above the cutoff in body)'],
+	['id' => 'syntax-wildcard-inter',
+	 'query' => 'inter*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['Internet', 'Internet Explorer', 'International Committee of the Red Cross'], 'top_n' => 5,
+	 'note' => 'inter* reaches internet / international'],
+	['id' => 'syntax-wildcard-photo',
+	 'query' => 'photo*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['Photography', 'Photographer'], 'top_n' => 3,
+	 'note' => 'photo* reaches photography, not photodiode'],
+	['id' => 'syntax-wildcard-with-word',
+	 'query' => 'solar s*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_top' => 'Solar System', 'max_time' => 5.0, 'max_mem_mb' => 80,
+	 'note' => 'Word + single-letter prefix: documents matching both rank first'],
+	['id' => 'syntax-wildcard-world-war',
+	 'query' => 'wor* war', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['World War II', 'World War I'], 'top_n' => 3,
+	 'note' => 'Commonest completion "world" reaches the obvious pages'],
+	['id' => 'syntax-wildcard-john-smith',
+	 'query' => 'john sm*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['John Smith (explorer)'], 'top_n' => 5,
+	 'note' => 'sm* reaches smith'],
+	['id' => 'syntax-wildcard-budget-off',
+	 'query' => 'comp*', 'confidence' => 100, 'algo' => 'auto',
+	 'opts' => ['wildcard_row_budget' => 0],
+	 'expect_in_top' => ['Computer', 'Quantum computer', 'Cloud computing', 'Computer science'], 'top_n' => 10,
+	 'note' => 'wildcard_row_budget = 0 leaves only the completion cap; comp* is unaffected either way'],
+	// Rarity on a prefix: one credit for the rarest completion a document
+	// contains, so the uncommon end of the word family surfaces. Under the
+	// old per-completion sum, Rarity on "un*" ranked Uncertainty principle
+	// first for using twelve ordinary un- words.
+	['id' => 'syntax-wildcard-rarity-tail',
+	 'query' => 'photo*', 'confidence' => 100, 'algo' => 'idf',
+	 'expect_in_top' => ['Photodetector', 'Photocatalysis', 'Photobleaching', 'Photogram'], 'top_n' => 5,
+	 'note' => 'Rarity brings up the uncommon photo- words; Frequency/auto bring up Photography'],
+	['id' => 'syntax-wildcard-rarity-neuro',
+	 'query' => 'neuro*', 'confidence' => 100, 'algo' => 'idf',
+	 'expect_in_top' => ['Neuroethology', 'Neuropeptide', 'Neurolinguistic programming'], 'top_n' => 5,
+	 'note' => 'Coverage gives Neuron/Neurology here; Rarity the periphery of the vocabulary'],
+	['id' => 'syntax-wildcard-rarity-with-word',
+	 'query' => 'solar s*', 'confidence' => 100, 'algo' => 'idf',
+	 'expect_top' => 'Solar System', 'max_time' => 5.0,
+	 'note' => 'A typed rare word still dominates a prefix under Rarity'],
+	// Compound numbers are phrases of their digit parts. The first run of
+	// this rule returned nothing for "pi 3.14" with stemming on: rootWords()
+	// dropped one-character words, so the required "3" had an empty stem
+	// group and no document could pass — a bug that had silently affected
+	// any required one-letter word since the length filter was added.
+	['id' => 'syntax-compound-decimal',
+	 'query' => 'pi 3.14', 'confidence' => 85, 'algo' => 'auto', 'stemming' => true,
+	 'expect_top' => 'Pi', 'expect_max' => 300,
+	 'note' => '3.14 is the phrase [3, 14]; as two numbers it matched 12K docs and FIFA 14 led'],
+	['id' => 'syntax-compound-date',
+	 'query' => '2024-05-01', 'confidence' => 100, 'algo' => 'auto', 'stemming' => true,
+	 'expect_min' => 1, 'expect_max' => 200,
+	 'note' => 'Numeric date as a phrase: dozens of documents, not the 5000 that mention 2024'],
+	['id' => 'syntax-compound-off',
+	 'query' => 'pi 3.14', 'confidence' => 85, 'algo' => 'auto', 'stemming' => true,
+	 'opts' => ['compound_numbers' => 'words'],
+	 'expect_min' => 4000,
+	 'note' => 'Knob: as independent words the numbers match thousands of documents'],
+	['id' => 'syntax-required-one-letter',
+	 'query' => '+x ray', 'confidence' => 100, 'algo' => 'auto', 'stemming' => true,
+	 'expect_min' => 100,
+	 'note' => 'A required one-character word with stemming on used to return nothing (rootWords dropped it)'],
+	['id' => 'syntax-wildcard-hyphenated',
+	 'query' => 'object-orient*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_in_top' => ['Object-oriented programming'], 'top_n' => 3, 'expect_min' => 100,
+	 'note' => 'Hyphenated prefix: object + orient* (joining to objectorient* matched nothing)'],
+	['id' => 'syntax-excluded-wildcard-complete',
+	 'query' => 'football -americ*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_min' => 3000,
+	 'note' => 'Excluded prefixes use SQL doc-id sets, untouched by the expansion order'],
 ];
 
 foreach ($syntaxTests as $st) {
-	$st['algo']  = 'bm25';
+	$st['algo']  = $st['algo'] ?? 'bm25';   // a test may pin its own (wildcard tests use auto → freq)
 	$st['group'] = 'syntax';
 	$tests[] = $st;
 }
@@ -365,11 +543,47 @@ $featureTests = [
 	 'expect_min' => 0,
 	 'note' => 'All stopwords filtered = no search terms'],
 
+	// WordNet synonyms. Groups come from lib/OewnSynonyms.php as plain data;
+	// the engine adds them to OPTIONAL words only, at the typed word's own
+	// boost, and maps each back to its origin concept so the title bonus
+	// still fires ("Couch" is a title match for a query of sofa). Coverage
+	// used to be thin here — one test asserting expect_min 1 — so these pin
+	// the three properties that matter: recall goes up, the typed word's
+	// own article still wins, and required words are never expanded.
 	['id' => 'feat-synonyms',
 	 'query' => 'monster', 'confidence' => 100,
 	 'synonyms' => true,
-	 'expect_min' => 1,
-	 'note' => 'Synonym expansion (requires oewn.db)'],
+	 'expect_top' => 'Monster', 'expect_min' => 2500,
+	 'note' => 'Synonym expansion (giant, goliath, behemoth, colossus) — typed word still ranks first'],
+	['id' => 'feat-synonyms-recall',
+	 'query' => 'sofa', 'confidence' => 100,
+	 'synonyms' => true,
+	 'expect_in_top' => ['Couch'], 'top_n' => 3, 'expect_min' => 250,
+	 'note' => 'sofa → couch, lounge: 31 documents without WordNet, ~310 with'],
+	['id' => 'feat-synonyms-off-baseline',
+	 'query' => 'sofa', 'confidence' => 100,
+	 'expect_max' => 60,
+	 'note' => 'Same query without WordNet, so the recall test above measures the expansion and not the corpus'],
+	['id' => 'feat-synonyms-optional-only',
+	 'query' => '+sofa', 'confidence' => 100,
+	 'synonyms' => true,
+	 'expect_max' => 60,
+	 'note' => 'Required words are never given synonyms: +sofa matches the literal word only'],
+	['id' => 'feat-synonyms-typed-wins',
+	 'query' => 'physician', 'confidence' => 100,
+	 'synonyms' => true,
+	 'expect_top' => 'Physician', 'expect_min' => 4000,
+	 'note' => 'doctor/doc/md added at the same boost; the exact title still wins on the title bonus'],
+	['id' => 'feat-synonyms-senses',
+	 'query' => 'bank', 'confidence' => 100,
+	 'synonyms' => true, 'senses' => 3,
+	 'expect_top' => 'Bank', 'expect_min' => 4950,
+	 'note' => 'Three senses add deposit/rely/bet/count to cant/camber; broader but Bank still first'],
+	['id' => 'feat-synonyms-senses-primary',
+	 'query' => 'bank', 'confidence' => 100,
+	 'synonyms' => true, 'senses' => 1,
+	 'expect_max' => 4900,
+	 'note' => 'Primary sense only (the demo default): fewer matches than three senses'],
 
 	['id' => 'feat-stem-fuzzy',
 	 'query' => 'runing', 'confidence' => 85, 'stemming' => true,
@@ -422,8 +636,8 @@ $perfTests = [
 
 	['id' => 'perf-wildcard-broad',
 	 'query' => 'th*', 'confidence' => 100,
-	 'max_time' => 1.0,
-	 'note' => 'Broad wildcard — many matches'],
+	 'max_time' => 2.0,
+	 'note' => 'Broad wildcard — many matches (commonest completions do real work, ~0.9 s; uncapped this once took 78 s)'],
 
 	['id' => 'perf-fuzzy-multiword',
 	 'query' => 'einstein albert relativity', 'confidence' => 85,
@@ -439,10 +653,45 @@ $perfTests = [
 	 'query' => 'einstien', 'confidence' => 85,
 	 'max_time' => 0.3,
 	 'note' => 'Single-word typo correction — lightweight'],
+
+	// Memory budgets. Retrieval streams postings into one coverage bitmask
+	// per document and materializes rows for the pruned survivors only, so
+	// memory grows with matched documents (~40 B each), not posting rows.
+	// The earlier row-per-posting design reached 100 MB on "new york city"
+	// and 334 MB on the phrase below; these bounds are generous multiples of
+	// the measured peaks and catch a slide back to that design (3-10x more)
+	// without flaking on allocator noise. Measured as growth over the
+	// pre-search footprint (PHP 8.2+; older runtimes skip the check).
+	['id' => 'perf-mem-phrase-stopwords',
+	 'query' => '"the united states of america"', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_min' => 500, 'max_mem_mb' => 90, 'max_time' => 4.0,
+	 'note' => 'Anchors on "america" (13K docs) and looks the/of up for those only'],
+	['id' => 'perf-mem-three-common-words',
+	 'query' => 'new york city', 'confidence' => 85, 'algo' => 'auto', 'stemming' => true,
+	 'expect_top' => 'New York City', 'max_mem_mb' => 60,
+	 'note' => 'Three mid-frequency words plus ~50 expansions, 250K posting rows'],
+	['id' => 'perf-mem-long-optional',
+	 'query' => 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty',
+	 'confidence' => 85, 'algo' => 'auto', 'stemming' => true,
+	 'expect_min' => 4000, 'max_mem_mb' => 60, 'max_time' => 6.0,
+	 'note' => 'Twenty optional words'],
+	['id' => 'perf-exhaustive-phrase',
+	 'query' => '"with you"', 'confidence' => 100, 'algo' => 'auto',
+	 'opts' => ['candidate_limit' => 0],
+	 'expect_min' => 40, 'max_time' => 6.0,
+	 'note' => 'Exhaustive phrase: 70K survivor ids go to SQLite in chunks (one IN list hit the 32,766-variable cap)'],
+	['id' => 'perf-wildcard-required-prefix',
+	 'query' => '+s*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_min' => 4000, 'max_time' => 6.0, 'max_mem_mb' => 80,
+	 'note' => 'Required single-letter prefix: the common-word sample cap applies to the whole group and the prefix prunes (a per-term cap reached 676 MB)'],
+	['id' => 'perf-wildcard-single-letter',
+	 'query' => 's*', 'confidence' => 100, 'algo' => 'auto',
+	 'expect_min' => 4000, 'max_time' => 5.0, 'max_mem_mb' => 80,
+	 'note' => 'Broadest prefix: the posting-row budget keeps it near 2 s and flat in memory'],
 ];
 
 foreach ($perfTests as $pt) {
-	$pt['algo']  = 'bm25';
+	$pt['algo']  = $pt['algo'] ?? 'bm25';
 	$pt['group'] = 'performance';
 	$tests[] = $pt;
 }
@@ -589,6 +838,10 @@ $expansionTests = [
 	 'query' => 'decision', 'confidence' => 100, 'derivations' => true,
 	 'expect_top' => 'Decision', 'expect_min' => 2500,
 	 'note' => 'Derivational expansion — decision also searches decide (OEWN link)'],
+	['id' => 'exp-derivations-govern',
+	 'query' => 'govern', 'confidence' => 100, 'derivations' => true,
+	 'expect_in_top' => ['Governance', 'Government'], 'top_n' => 5, 'expect_min' => 1500,
+	 'note' => 'govern → governance, governing, government, governor: reaches what suffix stripping cannot (no "govern" article exists)'],
 
 	['id' => 'exp-excl-phrase-and',
 	 'query' => '+"world war" -"cold war"', 'confidence' => 100,
@@ -895,12 +1148,46 @@ foreach ($tests as $t) {
 	$groupCounts[$g] = ($groupCounts[$g] ?? 0) + 1;
 }
 
-echo "MultiSearch Test Suite\n";
+echo "MultiSearch Test Suite\n" . date("Y-m-d H:i:s") . "\n";
 echo str_repeat('=', 76) . "\n";
 echo "$totalTests tests: ";
 foreach ($groupCounts as $g => $c) echo "$g($c) ";
 echo "\nIndex: " . DB_PATH . "  |  positions: " . ($INDEX_POSITIONAL ? 'YES (adjacency phrase semantics)' : 'no (word-level phrase semantics)')
 	. "  |  diacritics: " . ($INDEX_FOLDED ? 'FOLDED' : 'kept');
+
+// Runtime settings and knobs. Printed so a saved run (and a pasted terminal
+// log) says what it was measured under: the header used to name only the
+// index path, and comparing two runs meant guessing whether a default had
+// moved between them. Everything below is read from the objects the tests
+// actually use, never retyped.
+$eng = $searcher->settings();
+$idxMeta = [];
+try {
+	$mdb = new PDO('sqlite:' . DB_PATH);
+	$idxMeta = $mdb->query("SELECT key, value FROM meta")->fetchAll(PDO::FETCH_KEY_PAIR);
+	$idxDocs = (int)$mdb->query("SELECT MAX(total_docs) FROM field_stats")->fetchColumn();
+	$mdb = null;
+} catch (Exception $e) { $idxDocs = 0; }
+$fmtKnobs = function (array $kv): string {
+	$out = [];
+	foreach ($kv as $k => $v) $out[] = $k . ' ' . (is_bool($v) ? ($v ? 'on' : 'off') : (is_array($v) ? json_encode($v) : $v));
+	return implode(' · ', $out);
+};
+echo "\n" . str_repeat('-', 76);
+echo "\nEngine {$eng['version']}  |  PHP " . PHP_VERSION . "  |  memory_limit " . ini_get('memory_limit')
+	. "  |  index built " . ($idxMeta['built_at'] ?? '?') . ", " . number_format($idxDocs) . " docs, tokenizer " . ($idxMeta['tokenizer_name'] ?? '?');
+echo "\nCorpus profile: config/corpus-wikipedia.php  |  fields " . $fmtKnobs($defaultFields)
+	. "  |  title_field " . ($eng['title_field'] ?? 'none') . "  |  heavy_fields " . (implode(',', $eng['heavy_fields']) ?: 'none')
+	. "  |  field_b " . json_encode($eng['field_b']);
+echo "\nWordNet: " . ($hasOewn ? OEWN_DB_PATH . ' ready' : 'NOT available (synonym/derivation tests skip)')
+	. "  |  stem_verifier " . ($eng['stem_verifier'] ? 'on (OEWN)' : 'off')
+	. "  |  stopword list " . count($stopwordsDefault) . " words (only when a test asks)";
+echo "\nRecall caps: " . $fmtKnobs(array_intersect_key($eng, array_flip(['candidate_limit', 'phase1_limit', 'highfreq_cutoff', 'max_fuzzy_per_term', 'max_wildcard_expansions', 'wildcard_row_budget', 'broad_cap'])));
+echo "\nRanking knobs: " . $fmtKnobs($eng['ranking']);
+if (!empty($CONFIG_RK)) echo "\n  --rk overrides in effect: " . json_encode($CONFIG_RK) . " (label: $CONFIG_NAME)";
+echo "\nPer-test defaults: confidence 100 (fuzzy off) · per_page 20 · stemming, stopwords, synonyms, derivations OFF unless the test sets them"
+	. " · algo: section default (bm25 unless a test pins one) · positions " . ($INDEX_POSITIONAL ? 'on' : 'off');
+echo "\nLabeled study: every query x " . count($algos) . " algos · confidence 85 · stemming on · no stopwords, no WordNet · per_page 50";
 echo "\n" . str_repeat('=', 76) . "\n\n";
 
 $currentGroup = '';
@@ -982,6 +1269,11 @@ foreach ($tests as $test) {
 	// phrase_mode passthrough — lets A/B tests force word-level phrase
 	// semantics on a positional index.
 	if (isset($test['phrase_mode'])) $searchOpts['phrase_mode'] = $test['phrase_mode'];
+	// Generic option passthrough (candidate_limit, two_phase, wildcard_row_budget, ...)
+	// for tests that exercise one engine switch.
+	if (!empty($test['opts'])) $searchOpts = $test['opts'] + $searchOpts;
+	// expect_diag needs the diagnostics channel on.
+	if (isset($test['expect_diag'])) $searchOpts['diagnostics'] = true;
 
 	// Synonym expansion
 	if (!empty($test['synonyms'])) {
@@ -991,7 +1283,8 @@ foreach ($tests as $test) {
 			printf("  %-6s %-42s SKIP (no oewn.db)\n", $algo, $id);
 			continue;
 		}
-		$searchOpts['synonyms'] = $oewn->groupsFor(\MultiSearch\OewnSynonyms::queryWords($query), 1);
+		// 'senses' widens the WordNet lookup (1 = primary sense only, the demo's default; up to 3)
+		$searchOpts['synonyms'] = $oewn->groupsFor(\MultiSearch\OewnSynonyms::queryWords($query, $stopwordsDefault), (int)($test['senses'] ?? 1));
 	}
 
 	// Derivational expansion (same OEWN dependency as synonyms)
@@ -1002,13 +1295,20 @@ foreach ($tests as $test) {
 			printf("  %-6s %-42s SKIP (no oewn.db)\n", $algo, $id);
 			continue;
 		}
-		$searchOpts['derivations'] = $oewn->derivationsFor(\MultiSearch\OewnSynonyms::queryWords($query));
+		$searchOpts['derivations'] = $oewn->derivationsFor(\MultiSearch\OewnSynonyms::queryWords($query, $stopwordsDefault));
 	}
 
+	// Per-test peak memory (max_mem_mb): reset the peak counter first, so
+	// the reading is THIS search's high-water mark, not the process's.
+	if (function_exists('memory_reset_peak_usage')) memory_reset_peak_usage();
+	$memBefore = memory_get_usage(true);
 	$t0 = microtime(true);
 	try {
 		$result = $searcher->search($query, $searchOpts);
 		$elapsed = microtime(true) - $t0;
+		// growth over the pre-search footprint, so the suite's own baseline
+		// (OEWN, test tables, ~40 MB) doesn't count against the search
+		$peakMb  = (memory_get_peak_usage(true) - $memBefore) / 1048576;
 	} catch (\Throwable $e) {
 		$fail++;
 		$errors[] = "CRASH $id: " . $e->getMessage();
@@ -1091,6 +1391,27 @@ foreach ($tests as $test) {
 	if (isset($test['max_time']) && $elapsed > $test['max_time']) {
 		$ok = false;
 		$reason = "too slow: " . round($elapsed, 2) . "s > {$test['max_time']}s";
+	}
+	// max_mem_mb: retrieval memory is proportional to matched documents, not
+	// posting rows (coverage bitmasks, survivors-only materialization); these
+	// assertions keep it that way. Only meaningful on PHP 8.2+
+	// (memory_reset_peak_usage); older runtimes skip the check.
+	if (isset($test['max_mem_mb']) && function_exists('memory_reset_peak_usage') && $peakMb > $test['max_mem_mb']) {
+		$ok = false;
+		$reason = "too much memory: " . round($peakMb) . " MB > {$test['max_mem_mb']} MB";
+	}
+	// expect_diag: ['dot.path' => value] against the diag channel, e.g.
+	// ['candidates.truncated' => true] or ['query.numeric_exact' => ['19']].
+	if (isset($test['expect_diag'])) {
+		foreach ($test['expect_diag'] as $path => $want) {
+			$got = $result['diag'] ?? null;
+			foreach (explode('.', $path) as $seg) { $got = is_array($got) && array_key_exists($seg, $got) ? $got[$seg] : null; }
+			if ($got !== $want) {
+				$ok = false;
+				$reason = "diag $path: expected " . json_encode($want) . ", got " . json_encode($got);
+				break;
+			}
+		}
 	}
 
 	if (!$ok) {

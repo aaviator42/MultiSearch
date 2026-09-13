@@ -326,6 +326,26 @@ function indexIdentity(): ?string {
 	return $ident;
 }
 
+// Whether the index was built with diacritics folded (café -> cafe). Read
+// from meta.tokenizer_name, the same row the Searcher consults to decide
+// whether to fold query terms, so the help text and the engine agree.
+// Kept OUT of indexIdentity() on purpose: that string is the cache key and
+// the log's build label, and appending a fold marker would orphan every
+// cached result and split the per-build log breakdown for no ranking change.
+// The build default folds, so this is true for the shipped index.
+function indexFolded(): bool {
+	static $folded = null;
+	if ($folded !== null) return $folded;
+	$folded = false;
+	try {
+		$mdb  = new PDO('sqlite:' . DB_PATH, null, null,
+			[PDO::SQLITE_ATTR_OPEN_FLAGS => PDO::SQLITE_OPEN_READONLY]);
+		$name = $mdb->query("SELECT value FROM meta WHERE key = 'tokenizer_name'")->fetchColumn();
+		$folded = ($name === \MultiSearch\Searcher::TOKENIZER_FOLDED);
+	} catch (Exception $e) {}
+	return $folded;
+}
+
 // ── Check index ──────────────────────────────────────────────────────────
 // Probes postings_body — the index has one postings table per field, and
 // body is the one every Wikipedia article has.
@@ -394,7 +414,13 @@ $defaults = [
 	// search branch below explains why unticking still sticks. OEWN degrades
 	// gracefully when oewn.db is absent.
 	'stemming'      => '1',
-	'remove_stopwords' => '',
+	// Stopword removal defaults ON. It was off on the theory that BM25's IDF
+	// suppresses common words anyway — true for BM25 and Rarity, false for
+	// Coverage and Frequency, which auto routes to most. Measured 2026-09-10:
+	// question queries went from 0.60 to 0.93 MRR with the list on, and the
+	// agent study's worst pages ("who was the first woman in space" -> A
+	// Wrinkle in Time) were all wordy queries with the list off.
+	'remove_stopwords' => '1',
 	'use_oewn'      => '1',
 	'oewn_senses'   => 1,
 	'two_phase'     => '',
@@ -411,14 +437,14 @@ $post = $_POST + $defaults;
 // both in one public static on the Searcher, mixing a capability list with
 // UI text.
 $algoDescs = [
-	'auto'     => 'Auto: automatically selects the best scoring algorithm for your query, based on a measured quality study. Wildcard queries and detected typos use Frequency (accumulates the canonical article\'s many matching variants). Question-style queries (how/what/who...) use BM25F. Everything else uses Coverage, letting the title-match bonus surface the canonical page. Best choice when you want good results without thinking about algorithms.',
+	'auto'     => 'Auto: picks the algorithm from the shape of your query, using routing chosen by a measured quality study. Wildcards, detected typos, single words and question-style queries (how/what/who...) use Frequency; everything else uses Coverage. Best choice when you want good results without thinking about algorithms.',
 	'bm25'     => 'BM25: industry-standard relevance formula. Combines word frequency (with diminishing returns — the 20th occurrence matters much less than the 2nd), word rarity, and document length normalization so longer articles don\'t dominate. Popular for full-text search.',
 	'bm25+cov' => 'BM25+Coverage: BM25 relevance multiplied by a coverage bonus. A document matching all your search words gets a strong boost over partial matches, even if the partial match has higher raw BM25. Best for general-purpose search where you want the "obvious" result to rank #1.',
 	'bm25f'    => 'BM25F: multi-field BM25. Instead of scoring title, opening, and body separately then averaging, it combines their term frequencies first, weighted by field importance, then scores once, and applies the same all-words coverage bonus as BM25+Coverage. This means a title match boosts relevance more naturally than averaging separate per-field scores.',
 	'rrf'      => 'Reciprocal Rank Fusion: combines relevance depth (BM25) and query breadth (coverage) rankings using the reciprocal rank formula. Each algorithm contributes 1/(60+rank) to each document\'s final score. A document ranked #1 by both algorithms scores highest; one ranked high by only one still places well. Good for queries where neither relevance nor breadth alone gives the best ordering.',
-	'dfr'      => 'DFR (Divergence From Randomness): scores documents by how much a word\'s frequency exceeds what random chance would predict. If "quantum" appears 5 times in an article but statistics say it should appear ~0.3 times, that strong divergence produces a high score. No tuning parameters (unlike BM25). Good for single-word or technical queries.',
-	'cover'    => 'Coverage: document score = percentage of search query words found therein. A document containing 3 of 4 terms in the search query scores 75%, regardless of how many times they appear. Best when you want "match as many of these terms as possible" without caring about frequency or relevance depth.',
-	'idf'      => 'Rarity (IDF): rare words count more than common ones. When searching for "the frankenstein monster", "frankenstein" contributes far more to documents\' scores than "the" because it appears in fewer documents. Like Frequency, but distinctive terms are amplified and generic terms are suppressed.',
+	'dfr'      => 'DFR (Divergence From Randomness): scores documents by how much a word\'s frequency exceeds what random chance would predict. If "quantum" appears 5 times in an article but statistics say it should appear ~0.3 times, that strong divergence produces a high score. Favours short articles where a term is concentrated: good for technical terms, weak on names, where a short page about a relative can outrank the main article.',
+	'cover'    => 'Coverage: document score = the share of your query words found in the document. A document containing 3 of 4 query words scores 75%, regardless of how many times they appear. Best when you want "match as many of these terms as possible" without caring about frequency or relevance depth.',
+	'idf'      => 'Rarity (IDF): each matched word counts once, weighted by how rare it is across the corpus; how often it repeats within a document doesn\'t matter. In "quantum mechanics", quantum outweighs mechanics because fewer articles contain it. A wildcard is credited with the rarest completion a document contains, so photo* brings up the uncommon end of the word family (photobleaching, photodiode) ahead of photography. Good when distinctive terms should decide the ranking, or for exploring the less common words behind a prefix.',
 	'freq'     => 'Frequency: document score = how often your search words appear in it, with diminishing returns (log-damped: 20 occurrences count about 3x as much as two, not 10x). No length normalization, so long articles still have an edge, and every matching spelling variant of a word adds up — which is why Auto picks it for wildcards and typos. Useful when repetition signals topical focus.',
 ];
 
@@ -449,23 +475,21 @@ if (isset($_POST['query'])) {
 	$perPage    = in_array((int)$post['per_page'], [5, 10, 20, 50]) ? (int)$post['per_page'] : 20;
 	$page       = isset($_POST['do_search']) ? 1 : max(1, (int)$post['page']);
 
-	// Loaded lazily — only when removal is actually on (see the Defaults note).
-	$stopwords = [];
-	if ($removeStop) {
-		// The corpus config names the stopword list. The repo ships
-		// config/stopwords.json (118 English words) by default — hand-curated
-		// source, so it lives in config/, not in the disposable data/ dir.
-		// To use your own list, point the 'stopwords' key of your corpus config
-		// at it. The engine itself ships no list; a missing file means no
-		// removal (the engine default).
-		$stopwords = json_decode(@file_get_contents($CORPUS['stopwords'] ?? ''), true) ?? [];
-	}
+	// The corpus config names the stopword list. The repo ships
+	// config/stopwords.json (118 English words) by default — hand-curated
+	// source, so it lives in config/, not in the disposable data/ dir. To use
+	// your own list, point the 'stopwords' key of your corpus config at it.
+	// The engine itself ships no list; a missing file means no removal.
+	// Always loaded (it used to load only when removal was ticked): it also
+	// keeps function words out of the WordNet lookup below.
+	$stopwordList = json_decode(@file_get_contents($CORPUS['stopwords'] ?? ''), true) ?? [];
+	$stopwords    = $removeStop ? $stopwordList : [];
 	$synonyms  = [];
 	$derivations = [];
 	$elapsedExpand = 0.0;   // OEWN lookup time — runs outside the search timer
 	if ($useOewn) {
 		$tExp = microtime(true);
-		$qw = \MultiSearch\OewnSynonyms::queryWords($query);
+		$qw = \MultiSearch\OewnSynonyms::queryWords($query, $stopwordList);
 		$synonyms = $oewn->groupsFor($qw, $oewnSenses);
 		// Derivational expansion rides the same OEWN toggle.
 		$derivations = $oewn->derivationsFor($qw);
@@ -837,22 +861,28 @@ function goPage(n) {
 	?>
 		<li>
 			<strong><a href="<?= htmlspecialchars($wikiUrl) ?>" target="_blank"><?= htmlspecialchars($title) ?></a></strong>
-			(<?= $score ?>)<strong>:</strong>
+			<!-- (<?= $score ?>)<strong>:</strong> -->
 			<!-- <?= '<span class="field-label">' . $matchLine . '</span>'?> -->
 			<?php if ($snippet !== ''): ?>
 			<div class="snippet"><?= $snippet ?></div>
 			<?php endif; ?>
-			<?php if (count($r['field_scores']) > 1): ?>
-                <!-- <br> -->
+			<?php // Always shown. Earlier this block was skipped when only one field
+			      // was scored (count(field_scores) > 1), on the theory that a per-field
+			      // breakdown means nothing with one field — but it also hid the doc
+			      // score and the findings line, so setting two weights to 0 in the form
+			      // made every result lose its summary. ?>
                 <small style="color: #888; margin-top: 0.5rem; display: block;">
-                    field scores: 
-                    <?php foreach ($r['field_scores'] as $f => $fs): ?>
-                        <code><?= htmlspecialchars($f) ?></code>&nbsp;<?= number_format($fs, 3) ?>&ensp;
-                    <?php endforeach; ?>
+                    <?php
+                    // doc score first, then the per-field scores; separators between items only
+                    $scoreParts = ['scores:&nbsp;&nbsp;&nbsp;doc: ' . $score];
+                    foreach ($r['field_scores'] as $f => $fs) {
+                        $scoreParts[] = '<code>' . htmlspecialchars($f) . '</code>:&nbsp;' . number_format($fs, 3);
+                    }
+                    echo implode('&ensp;|&nbsp;', $scoreParts);
+                    ?>
                 </small>
-                <?= '<small>findings: &nbsp; <span style="color: #888;">' . $matchLine . '</span></small>'?>
+                <?= '<small><span style="color: #888;">findings: ' . $matchLine . '</span></small>'?>
                 <br><br>
-			<?php endif; ?>
 		</li>
 	<?php endforeach; ?>
 	</ol>
@@ -893,35 +923,88 @@ function goPage(n) {
 	// exact phrase operators: no silent rewriting.
 	$diag = $result['diag'] ?? null;
 	if ($diag !== null):
+		// Two lines, because expansions do two different things. A variant
+		// of an optional word ADMITS documents (a doc matching only "thinking"
+		// is a hit for `think`), and so does a stem variant of a required
+		// word — passesRequired() ORs within the stem group, so `"systems"`
+		// matches "system" docs too. But a morph variant of a required or
+		// quoted word, and any variant of a word inside a positional phrase,
+		// can only re-order documents the literal words already admitted.
+		// Printing those under "Also searched" claimed a widened match set
+		// that never happened (`"think"`: 4,709 hits = exactly the literal
+		// word, yet five "also searched" variants).
+		$required  = $diag['query']['required'] ?? [];
+		$inPhrase  = [];
+		if (!empty($diag['positional_phrases'])) {
+			foreach ($diag['query']['req_phrases'] ?? [] as $group) {
+				foreach ($group as $w) $inPhrase[$w] = true;
+			}
+		}
+		$searched = [];   // class => [terms]  — widened the match set
+		$ranked   = [];   // class => [terms]  — ranking only
+		foreach ($diag['expansions'] as $e) {
+			$from = $e['from'];
+			$widens = !in_array($from, $required, true)                   // optional word: always
+				|| (!isset($inPhrase[$from]) && $e['class'] === 'stem');  // required stem OR-group
+			if ($widens) $searched[$e['class']][] = $e['term'];
+			else         $ranked[$e['class']][]   = $e['term'];
+		}
+		$fmt = function (array $byClass): array {
+			$out = [];
+			foreach ($byClass as $cls => $terms) {
+				$shown = array_slice(array_unique($terms), 0, 6);
+				$more  = count(array_unique($terms)) - count($shown);
+				$out[] = htmlspecialchars($cls) . ': <em>' . htmlspecialchars(implode(', ', $shown))
+					. ($more > 0 ? ", +$more" : '') . '</em>';
+			}
+			return $out;
+		};
+
 		$parts = [];
 		foreach ($diag['typo_swaps'] as $sw) {
+			// A swap the context guard blocked is recorded with promoted = null
+			// (the engine considered a correction and kept the typed word). It
+			// used to print as "corrected volcanoe →" with nothing after the
+			// arrow; nothing was corrected, so nothing is shown. The candidate
+			// still appears in the fuzzy list.
+			if (empty($sw['promoted'])) continue;
 			$parts[] = 'corrected <em>' . htmlspecialchars($sw['typed']) . '</em> → <em>'
 				. htmlspecialchars($sw['promoted']) . '</em>';
 		}
-		$byClass = [];
-		foreach ($diag['expansions'] as $e) $byClass[$e['class']][] = $e['term'];
-		foreach ($byClass as $cls => $terms) {
-			$shown = array_slice(array_unique($terms), 0, 6);
-			$more  = count(array_unique($terms)) - count($shown);
-			$parts[] = htmlspecialchars($cls) . ': <em>' . htmlspecialchars(implode(', ', $shown))
-				. ($more > 0 ? ", +$more" : '') . '</em>';
-		}
+		$parts = array_merge($parts, $fmt($searched));
 		foreach ($diag['wildcards'] as $prefix => $w) {
 			$parts[] = htmlspecialchars($prefix) . ' → ' . (int)$w['count'] . ' terms';
 		}
+		// Numbers are matched exactly (since engine 3.6: no fuzzy variants for
+		// numeric terms — "19" is not a typo for "1").
+		if (!empty($diag['query']['numeric_exact'])) {
+			$parts[] = 'exact numbers: <em>'
+				. htmlspecialchars(implode(', ', $diag['query']['numeric_exact'])) . '</em>';
+		}
+		// Every required/phrase word was a very common one, so the engine
+		// verified the query on docs matching the optional words and topped
+		// up with a sample (see broad_cap in lib/MultiSearch.php).
+		if (!empty($diag['candidates']['truncated'])) {
+			$parts[] = '<em>very broad query — common-word matches are sampled</em>';
+		}
+		$considered = $fmt($ranked);
 		if (!empty($parts)): ?>
 	Also searched — <?= implode(' &nbsp;|&nbsp; ', $parts) ?><br>
+	<?php endif; if (!empty($considered)): ?>
+	Also considered — <?= implode(' &nbsp;|&nbsp; ', $considered) ?><br>
 	<?php endif; endif; ?>
 	<?php
 	// Honest totals. Without Exhaustive, the engine scores at most
 	// candidate_limit docs (engine default 5000 — see the corpus-profile key
 	// 'candidate_limit' in lib/MultiSearch.php), so a total AT the cap is a
 	// sample, not a count. Earlier versions printed the raw number as exact.
-	$isCapped = !$exhaustive && $result['total'] >= 5000;
+	$isCapped    = !$exhaustive && $result['total'] >= 5000;
+	$isTruncated = !empty($result['diag']['candidates']['truncated']);
 	?>
 	Results: <?= $isCapped
 		? '5,000+ <small>(capped — enable exhaustive mode for exact count)</small>'
-		: number_format($result['total']) . ' total' ?>
+		: number_format($result['total']) . ' total'
+		  . ($isTruncated ? ' <small>(sampled — every query word is very common)</small>' : '') ?>
 	&nbsp;|&nbsp; Page: <?= $result['page'] ?>/<?= $result['pages'] ?>
 	&nbsp;|&nbsp; Time: <?= $elapsed ?>s
 </div>
@@ -933,18 +1016,22 @@ function goPage(n) {
 <br>
 <b>Query syntax:</b>
 <?php
-// The phrase bullet is CONDITIONAL on the index — quotes mean adjacency on a
+// Two bullets are CONDITIONAL on the index. Quotes mean adjacency on a
 // positional index (the default build) and word-level all-words-required
-// semantics on a --no-positions build. indexIdentity() is already cached per
-// request for the search log, so this costs nothing extra.
+// semantics on a --no-positions build; indexIdentity() is already cached per
+// request for the search log, so this costs nothing extra. The accent note
+// only appears when the index was built folded (the default; --no-fold keeps
+// café and cafe apart, and then the sentence would be a lie) — see
+// indexFolded().
 $ixPositional = str_contains((string)indexIdentity(), '+pos');
 ?>
 <ul>
 	<li><code>sun moon comet</code> — Optional words: any may match; documents matching
-		more of them rank higher. Typo-tolerant when Confidence &lt; 100
-		(<code>jupitor</code> finds Jupiter).</li><br>
+		more of them rank higher. Typo-tolerant when confidence set to &lt; 100.</li><br>
 	<li><code>+comet</code> — Required: only documents containing it are returned.
-		Required words are matched exactly, never typo-corrected.</li><br>
+		Required words are matched exactly, never typo-corrected; when stemming on,
+		other forms of the word also count (<code>+moons</code> is satisfied by
+		<em>moon</em>).</li><br>
 	<li><code>-pluto</code> — Excluded: no document containing it is returned.</li><br>
 	<?php if ($ixPositional): ?>
 	<li><code>"solar system"</code> — Exact phrase: the words must appear next to each
@@ -957,15 +1044,19 @@ $ixPositional = str_contains((string)indexIdentity(), '+pos');
 		excludes documents with all the phrase's words in one field).</li><br>
 	<?php endif; ?>
 	<li><code>astro*</code> — Prefix wildcard: matches <em>astronomy, astronaut, …</em>
-		(the 100 rarest completions). <code>-galax*</code> excludes <b>every</b> matching
-		document — exclusions have no cap.</li><br>
+		(the 100 commonest completions, skipping words so frequent they'd match most of the
+		corpus). <code>-galax*</code> excludes every matching document, exclusions
+		have no cap.</li><br>
 	<li><code>nebula^2</code> — Weight a word in scoring (any factor, e.g. <code>^1.5</code>).</li><br>
 	<li>Everything combines: <code>+astro*^1.5 "solar system" -"black hole" comet</code></li><br>
-	<li>Punctuation is normalized: <code>halley's</code> finds <em>halleys</em>,
-		<code>gamma-ray</code> searches <em>gamma ray</em> — and inside quotes the words
-		stay consecutive.</li><br>
-	<li>Precedence: excluded > required > optional. Expansion options (stemming,
-		synonyms) add word forms — added forms never outrank the words you typed.</li>
+	<li>Punctuation and case are normalized: <code>halley's</code> finds <em>halleys</em>,
+		<code>Gamma-Ray</code> searches <em>gamma ray</em>. Words quotes 
+		 consecutive.<?php if (indexFolded()): ?> Accents: <code>sao paulo</code>
+		and <code>são paulo</code> find the same article.<?php endif; ?></li><br>
+	<li>Precedence: excluded > required > optional. Outside quotes, word order doesn't
+		matter. Expansion options
+		(stemming, synonyms) add word forms — added forms never outrank the words you
+		typed.</li>
 </ul>
 
 <br>
